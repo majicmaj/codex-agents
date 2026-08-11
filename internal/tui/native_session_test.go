@@ -58,6 +58,10 @@ func TestBridgeNativeInputReservesOnlyPlainLeft(t *testing.T) {
 	}{
 		{name: "csi left", input: "\x1b[D", wantBack: true},
 		{name: "kitty left", input: "\x1b[1;1D", wantBack: true},
+		{name: "kitty explicit left press", input: "\x1b[1;1:1D", wantBack: true},
+		{name: "kitty repeated left", input: "\x1b[1;1:2D", wantBack: true},
+		{name: "kitty left release", input: "\x1b[1;1:3D", wantOutput: "\x1b[1;1:3D"},
+		{name: "kitty left with caps lock", input: "\x1b[1;65:1D", wantBack: true},
 		{name: "application left", input: "\x1bOD", wantBack: true},
 		{name: "left with input", input: "x\x1b[D", wantOutput: "x\x1b[D"},
 		{name: "left after cursor edit and deleting input", input: "xy\x1b[D\x7f\x1b[3~\x1b[D", wantOutput: "xy\x1b[D\x7f\x1b[3~", wantBack: true},
@@ -65,6 +69,7 @@ func TestBridgeNativeInputReservesOnlyPlainLeft(t *testing.T) {
 		{name: "left after ctrl u", input: "draft\x15\x1b[D", wantOutput: "draft\x15", wantBack: true},
 		{name: "left after home and delete", input: "x\x1b[H\x1b[3~\x1b[D", wantOutput: "x\x1b[H\x1b[3~", wantBack: true},
 		{name: "left after clearing input", input: "x\x03\x1b[D", wantOutput: "x\x03", wantBack: true},
+		{name: "left after enhanced ctrl c", input: "x\x1b[99;5u\x1b[1;1:1D", wantOutput: "x\x1b[99;5u", wantBack: true},
 		{name: "left after submitting input", input: "x\r\x1b[D", wantOutput: "x\r", wantBack: true},
 		{name: "left after uncertain history", input: "\x1b[A\x1b[D", wantOutput: "\x1b[A\x1b[D"},
 		{name: "shift left", input: "\x1b[1;2D", wantOutput: "\x1b[1;2D"},

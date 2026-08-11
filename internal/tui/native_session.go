@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -157,7 +159,7 @@ func (p *nativeEscapeParser) feed(value byte) (output []byte, back bool) {
 
 	if value >= 0x40 && value <= 0x7e {
 		parameters := string(p.pending[2 : len(p.pending)-1])
-		if value == 'D' && (parameters == "" || parameters == "1" || parameters == "1;1") {
+		if value == 'D' && isPlainLeftPress(parameters) {
 			return p.flush(), true
 		}
 		return p.flush(), false
@@ -166,6 +168,59 @@ func (p *nativeEscapeParser) feed(value byte) (output []byte, back bool) {
 		return p.flush(), false
 	}
 	return nil, false
+}
+
+// Codex enables Kitty keyboard enhancement flags 1|2|4. Terminals that report
+// event types may include an explicit press/repeat suffix on an otherwise plain
+// Left key. Release events must stay forwarded and must not navigate away.
+func isPlainLeftPress(parameters string) bool {
+	if parameters == "" || parameters == "1" {
+		return true
+	}
+	key, modifiers, found := strings.Cut(parameters, ";")
+	if !found || key != "1" {
+		return false
+	}
+	modifierBits, event, ok := parseKittyModifierEvent(modifiers)
+	if !ok || event == 3 {
+		return false
+	}
+	// Caps Lock and Num Lock do not make Left a modified navigation key.
+	const nonLockModifiers = 1 | 2 | 4 | 8 | 16 | 32
+	return modifierBits&nonLockModifiers == 0
+}
+
+func parseKittyModifierEvent(value string) (modifierBits int, event int, ok bool) {
+	modifierValue, eventValue, hasEvent := strings.Cut(value, ":")
+	encoded, err := strconv.Atoi(modifierValue)
+	if err != nil || encoded < 1 {
+		return 0, 0, false
+	}
+	event = 1
+	if hasEvent {
+		event, err = strconv.Atoi(eventValue)
+		if err != nil || event < 1 || event > 3 {
+			return 0, 0, false
+		}
+	}
+	return encoded - 1, event, true
+}
+
+func isEnhancedCtrlC(sequence string) bool {
+	if !strings.HasPrefix(sequence, "\x1b[") || !strings.HasSuffix(sequence, "u") {
+		return false
+	}
+	keyCodes, modifiers, found := strings.Cut(sequence[2:len(sequence)-1], ";")
+	key, _, _ := strings.Cut(keyCodes, ":")
+	if !found || key != "99" {
+		return false
+	}
+	modifierBits, event, ok := parseKittyModifierEvent(modifiers)
+	if !ok || event == 3 {
+		return false
+	}
+	const nonLockModifiers = 1 | 2 | 4 | 8 | 16 | 32
+	return modifierBits&nonLockModifiers == 4
 }
 
 // nativeDraftState intentionally prefers false negatives over false positives:
@@ -192,6 +247,10 @@ func (s *nativeDraftState) observe(data []byte) {
 	}
 	if data[0] == '\x1b' {
 		sequence := string(data)
+		if isEnhancedCtrlC(sequence) {
+			s.units, s.cursor, s.exact = 0, 0, true
+			return
+		}
 		switch sequence {
 		case "\x1b[200~":
 			s.paste = true
