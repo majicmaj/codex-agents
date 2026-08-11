@@ -22,11 +22,23 @@ func TestMaybeUpdateVerifiesAndAtomicallyReplacesExecutable(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/repos/owner/repo/releases/latest":
+			if request.Header.Get("Accept") != "application/vnd.github+json" {
+				http.Error(writer, "metadata requires GitHub JSON", http.StatusUnsupportedMediaType)
+				return
+			}
 			fmt.Fprintf(writer, `{"tag_name":"v2.0.0","assets":[{"name":%q,"url":%q,"digest":%q},{"name":"SHA256SUMS","url":%q}]}`,
 				assetName, serverURL(request)+"/binary", "sha256:"+digest, serverURL(request)+"/sums")
 		case "/binary":
+			if request.Header.Get("Accept") != "application/octet-stream" {
+				http.Error(writer, "asset requires octet stream", http.StatusUnsupportedMediaType)
+				return
+			}
 			_, _ = writer.Write(newBinary)
 		case "/sums":
+			if request.Header.Get("Accept") != "application/octet-stream" {
+				http.Error(writer, "asset requires octet stream", http.StatusUnsupportedMediaType)
+				return
+			}
 			fmt.Fprintf(writer, "%s  %s\n", digest, assetName)
 		default:
 			http.NotFound(writer, request)
@@ -60,6 +72,10 @@ func TestMaybeUpdateRejectsChecksumMismatch(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/repos/owner/repo/releases/latest":
+			if request.Header.Get("Accept") != "application/vnd.github+json" {
+				http.Error(writer, "metadata requires GitHub JSON", http.StatusUnsupportedMediaType)
+				return
+			}
 			fmt.Fprintf(writer, `{"tag_name":"v2.0.0","assets":[{"name":%q,"url":%q},{"name":"SHA256SUMS","url":%q}]}`,
 				assetName, serverURL(request)+"/binary", serverURL(request)+"/sums")
 		case "/binary":

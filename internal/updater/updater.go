@@ -188,7 +188,7 @@ func githubToken() string {
 func latestRelease(ctx context.Context, options Options) (release, error) {
 	var result release
 	url := strings.TrimRight(options.APIBase, "/") + "/repos/" + options.Repository + "/releases/latest"
-	body, err := downloadBytes(ctx, options, url, 4<<20)
+	body, err := downloadJSON(ctx, options, url, 4<<20)
 	if err != nil {
 		if strings.Contains(err.Error(), "404") && options.Token == "" {
 			return result, errors.New("latest release is private; install GitHub CLI and run `gh auth login`")
@@ -212,12 +212,24 @@ func downloadBytes(ctx context.Context, options Options, url string, limit int64
 	return []byte(output.String()), nil
 }
 
+func downloadJSON(ctx context.Context, options Options, url string, limit int64) ([]byte, error) {
+	var output strings.Builder
+	if err := downloadToAccept(ctx, options, url, "application/vnd.github+json", &limitedWriter{writer: &output, remaining: limit}); err != nil {
+		return nil, err
+	}
+	return []byte(output.String()), nil
+}
+
 func downloadTo(ctx context.Context, options Options, url string, destination io.Writer) error {
+	return downloadToAccept(ctx, options, url, "application/octet-stream", destination)
+}
+
+func downloadToAccept(ctx context.Context, options Options, url, accept string, destination io.Writer) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
-	request.Header.Set("Accept", "application/octet-stream")
+	request.Header.Set("Accept", accept)
 	request.Header.Set("User-Agent", "codex-agents/"+options.CurrentVersion)
 	if options.Token != "" {
 		request.Header.Set("Authorization", "Bearer "+options.Token)
