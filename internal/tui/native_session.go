@@ -150,8 +150,7 @@ func (p *nativeEscapeParser) feed(value byte) (output []byte, back bool) {
 			return nil, false
 		}
 		if len(p.pending) == 3 && value == 'D' {
-			p.pending = p.pending[:0]
-			return nil, true
+			return p.flush(), true
 		}
 		return p.flush(), false
 	}
@@ -159,8 +158,7 @@ func (p *nativeEscapeParser) feed(value byte) (output []byte, back bool) {
 	if value >= 0x40 && value <= 0x7e {
 		parameters := string(p.pending[2 : len(p.pending)-1])
 		if value == 'D' && (parameters == "" || parameters == "1" || parameters == "1;1") {
-			p.pending = p.pending[:0]
-			return nil, true
+			return p.flush(), true
 		}
 		return p.flush(), false
 	}
@@ -168,6 +166,76 @@ func (p *nativeEscapeParser) feed(value byte) (output []byte, back bool) {
 		return p.flush(), false
 	}
 	return nil, false
+}
+
+// nativeDraftState intentionally prefers false negatives over false positives:
+// Left may return to Codex when state is uncertain, but it must never close a
+// session whose composer could contain text.
+type nativeDraftState struct {
+	units int
+	exact bool
+	paste bool
+}
+
+func newNativeDraftState() nativeDraftState {
+	return nativeDraftState{exact: true}
+}
+
+func (s nativeDraftState) definitelyEmpty() bool {
+	return s.exact && s.units == 0
+}
+
+func (s *nativeDraftState) observe(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	if data[0] == '\x1b' {
+		sequence := string(data)
+		switch sequence {
+		case "\x1b[200~":
+			s.paste = true
+		case "\x1b[201~":
+			s.paste = false
+		case "\x1b[13u", "\x1b[13;1u":
+			s.units, s.exact = 0, true
+		case "\x1b[13;2u":
+			s.units++
+		case "\x1b[A", "\x1b[B", "\x1b[H", "\x1b[F", "\x1b[1~", "\x1b[4~":
+			if s.units > 0 || sequence == "\x1b[A" || sequence == "\x1b[B" {
+				s.exact = false
+			}
+		case "\x1b[D", "\x1b[1D", "\x1b[1;1D", "\x1bOD", "\x1b[C", "\x1b[1C", "\x1b[1;1C", "\x1bOC":
+			if s.units > 0 {
+				s.exact = false
+			}
+		}
+		return
+	}
+
+	for _, value := range data {
+		switch value {
+		case 0x03: // Ctrl+C clears a non-empty Codex composer.
+			s.units, s.exact = 0, true
+		case '\r', '\n':
+			if s.paste {
+				s.units++
+			} else {
+				s.units, s.exact = 0, true
+			}
+		case 0x08, 0x7f:
+			if s.exact && s.units > 0 {
+				s.units--
+			}
+		case 0x01, 0x02, 0x05, 0x06, 0x0b, 0x15, 0x17:
+			if s.units > 0 {
+				s.exact = false
+			}
+		default:
+			if value >= 0x20 {
+				s.units++
+			}
+		}
+	}
 }
 
 func (p *nativeEscapeParser) flush() []byte {
@@ -197,6 +265,7 @@ func bridgeNativeInput(input io.Reader, output io.Writer, onBack func()) error {
 	}()
 
 	parser := nativeEscapeParser{}
+	draft := newNativeDraftState()
 	var timer *time.Timer
 	var timeout <-chan time.Time
 	resetTimer := func() {
@@ -234,12 +303,15 @@ func bridgeNativeInput(input io.Reader, output io.Writer, onBack func()) error {
 		case chunk := <-chunks:
 			for _, value := range chunk.data {
 				data, back := parser.feed(value)
+				if back {
+					if draft.definitelyEmpty() {
+						onBack()
+						return nil
+					}
+				}
+				draft.observe(data)
 				if err := write(data); err != nil {
 					return err
-				}
-				if back {
-					onBack()
-					return nil
 				}
 				if len(parser.pending) > 0 {
 					resetTimer()

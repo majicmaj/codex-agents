@@ -1771,7 +1771,7 @@ func (m Model) helpView() string {
 			"",
 			bold + "Native session" + reset,
 			"  The installed Codex TUI owns all rendering, commands, and keybindings.",
-			"  ← returns here immediately; /quit also exits and refreshes the overview.",
+			"  ← returns here when input is empty; /quit also exits and refreshes.",
 			"  A session already open in standalone Codex must be closed there first.",
 			"",
 			dim + "Press ? or Esc to close" + reset,

@@ -153,7 +153,8 @@ Native session:
 
 - Codex owns its complete keymap, composer, scrolling, selection, rendering,
   slash-command palette, approvals, diffs, tools, and attachments
-- Plain `←` immediately exits the native session and returns to Agents View
+- Plain `←` exits the native session only when its composer is empty; otherwise
+  it remains Codex's character-left key
 - `Shift+←`, `Ctrl+←`, and `Alt+←` remain available for native text selection
   and word movement; use `Ctrl+B` when character-left editing is needed
 - `/quit` also exits the native session and returns to Agents View
@@ -169,9 +170,9 @@ and related states from App Server and rollout events.
 ## MVP limitations
 
 - Unread/Ready state is kept only for the current UI process.
-- Plain left-arrow is reserved by the Agents View PTY bridge while native Codex
-  owns the terminal. This intentionally trades Codex's character-left shortcut
-  for one-key navigation; `Ctrl+B` retains character-left editing.
+- The Agents View PTY bridge conservatively tracks whether Codex's composer is
+  empty. Plain left-arrow returns to the overview only when emptiness is known;
+  ambiguous history/editor states remain inside Codex to avoid losing a draft.
 
 The protocol integration follows the official OpenAI App Server documentation:
 https://developers.openai.com/codex/app-server

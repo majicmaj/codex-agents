@@ -56,9 +56,14 @@ func TestBridgeNativeInputReservesOnlyPlainLeft(t *testing.T) {
 		wantOutput string
 		wantBack   bool
 	}{
-		{name: "csi left", input: "before\x1b[Dafter", wantOutput: "before", wantBack: true},
+		{name: "csi left", input: "\x1b[D", wantBack: true},
 		{name: "kitty left", input: "\x1b[1;1D", wantBack: true},
 		{name: "application left", input: "\x1bOD", wantBack: true},
+		{name: "left with input", input: "x\x1b[D", wantOutput: "x\x1b[D"},
+		{name: "left after deleting input", input: "x\x7f\x1b[D", wantOutput: "x\x7f", wantBack: true},
+		{name: "left after clearing input", input: "x\x03\x1b[D", wantOutput: "x\x03", wantBack: true},
+		{name: "left after submitting input", input: "x\r\x1b[D", wantOutput: "x\r", wantBack: true},
+		{name: "left after uncertain history", input: "\x1b[A\x1b[D", wantOutput: "\x1b[A\x1b[D"},
 		{name: "shift left", input: "\x1b[1;2D", wantOutput: "\x1b[1;2D"},
 		{name: "ctrl left", input: "\x1b[1;5D", wantOutput: "\x1b[1;5D"},
 		{name: "right", input: "\x1b[C", wantOutput: "\x1b[C"},
