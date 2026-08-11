@@ -172,9 +172,10 @@ func (p *nativeEscapeParser) feed(value byte) (output []byte, back bool) {
 // Left may return to Codex when state is uncertain, but it must never close a
 // session whose composer could contain text.
 type nativeDraftState struct {
-	units int
-	exact bool
-	paste bool
+	units  int
+	cursor int
+	exact  bool
+	paste  bool
 }
 
 func newNativeDraftState() nativeDraftState {
@@ -197,16 +198,32 @@ func (s *nativeDraftState) observe(data []byte) {
 		case "\x1b[201~":
 			s.paste = false
 		case "\x1b[13u", "\x1b[13;1u":
-			s.units, s.exact = 0, true
+			s.units, s.cursor, s.exact = 0, 0, true
 		case "\x1b[13;2u":
-			s.units++
+			if s.exact {
+				s.units++
+				s.cursor++
+			}
 		case "\x1b[A", "\x1b[B", "\x1b[H", "\x1b[F", "\x1b[1~", "\x1b[4~":
-			if s.units > 0 || sequence == "\x1b[A" || sequence == "\x1b[B" {
+			switch sequence {
+			case "\x1b[H", "\x1b[1~":
+				s.cursor = 0
+			case "\x1b[F", "\x1b[4~":
+				s.cursor = s.units
+			default:
 				s.exact = false
 			}
-		case "\x1b[D", "\x1b[1D", "\x1b[1;1D", "\x1bOD", "\x1b[C", "\x1b[1C", "\x1b[1;1C", "\x1bOC":
-			if s.units > 0 {
-				s.exact = false
+		case "\x1b[D", "\x1b[1D", "\x1b[1;1D", "\x1bOD":
+			if s.exact && s.cursor > 0 {
+				s.cursor--
+			}
+		case "\x1b[C", "\x1b[1C", "\x1b[1;1C", "\x1bOC":
+			if s.exact && s.cursor < s.units {
+				s.cursor++
+			}
+		case "\x1b[3~":
+			if s.exact && s.cursor < s.units {
+				s.units--
 			}
 		}
 		return
@@ -215,24 +232,50 @@ func (s *nativeDraftState) observe(data []byte) {
 	for _, value := range data {
 		switch value {
 		case 0x03: // Ctrl+C clears a non-empty Codex composer.
-			s.units, s.exact = 0, true
+			s.units, s.cursor, s.exact = 0, 0, true
 		case '\r', '\n':
 			if s.paste {
-				s.units++
+				if s.exact {
+					s.units++
+					s.cursor++
+				}
 			} else {
-				s.units, s.exact = 0, true
+				s.units, s.cursor, s.exact = 0, 0, true
 			}
 		case 0x08, 0x7f:
-			if s.exact && s.units > 0 {
+			if s.exact && s.cursor > 0 {
 				s.units--
+				s.cursor--
 			}
-		case 0x01, 0x02, 0x05, 0x06, 0x0b, 0x15, 0x17:
+		case 0x01: // Ctrl+A
+			s.cursor = 0
+		case 0x02: // Ctrl+B
+			if s.exact && s.cursor > 0 {
+				s.cursor--
+			}
+		case 0x05: // Ctrl+E
+			s.cursor = s.units
+		case 0x06: // Ctrl+F
+			if s.exact && s.cursor < s.units {
+				s.cursor++
+			}
+		case 0x0b: // Ctrl+K
+			if s.exact {
+				s.units = s.cursor
+			}
+		case 0x15: // Ctrl+U
+			if s.exact {
+				s.units -= s.cursor
+				s.cursor = 0
+			}
+		case 0x17: // Ctrl+W depends on word boundaries we cannot observe safely.
 			if s.units > 0 {
 				s.exact = false
 			}
 		default:
-			if value >= 0x20 {
+			if value >= 0x20 && (value < 0x80 || value >= 0xc0) && s.exact {
 				s.units++
+				s.cursor++
 			}
 		}
 	}
