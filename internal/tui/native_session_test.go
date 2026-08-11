@@ -2,7 +2,8 @@ package tui
 
 import (
 	"bytes"
-	"os"
+	"errors"
+	"io"
 	"reflect"
 	"testing"
 
@@ -34,15 +35,51 @@ func TestNativeNewSessionCommandSendsOverviewPrompt(t *testing.T) {
 	}
 }
 
-func TestNativeCodexCommandKeepsRealTerminalOutput(t *testing.T) {
+func TestNativeCodexCommandKeepsTerminalOwnershipInsidePTY(t *testing.T) {
 	wrapped := &nativeCodexCommand{command: nativeSessionCommand(appserver.Thread{ID: "test"})}
+	input := &bytes.Buffer{}
+	wrapped.SetStdin(input)
 	wrapped.SetStdout(&bytes.Buffer{})
 	wrapped.SetStderr(&bytes.Buffer{})
-	if wrapped.command.Stdout != os.Stdout {
-		t.Fatal("native Codex stdout was not attached directly to the terminal")
+	if wrapped.input != input {
+		t.Fatal("native Codex did not retain the parent input stream")
 	}
-	if wrapped.command.Stderr != os.Stderr {
-		t.Fatal("native Codex stderr was not attached directly to the terminal")
+	if wrapped.command.Stdin != nil || wrapped.command.Stdout != nil || wrapped.command.Stderr != nil {
+		t.Fatal("native Codex was attached before its PTY was created")
+	}
+}
+
+func TestBridgeNativeInputReservesOnlyPlainLeft(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		wantOutput string
+		wantBack   bool
+	}{
+		{name: "csi left", input: "before\x1b[Dafter", wantOutput: "before", wantBack: true},
+		{name: "kitty left", input: "\x1b[1;1D", wantBack: true},
+		{name: "application left", input: "\x1bOD", wantBack: true},
+		{name: "shift left", input: "\x1b[1;2D", wantOutput: "\x1b[1;2D"},
+		{name: "ctrl left", input: "\x1b[1;5D", wantOutput: "\x1b[1;5D"},
+		{name: "right", input: "\x1b[C", wantOutput: "\x1b[C"},
+		{name: "escape", input: "\x1b", wantOutput: "\x1b"},
+		{name: "text", input: "hello", wantOutput: "hello"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			back := false
+			err := bridgeNativeInput(bytes.NewBufferString(test.input), &output, func() { back = true })
+			if err != nil && !errors.Is(err, io.EOF) {
+				t.Fatalf("bridge error: %v", err)
+			}
+			if output.String() != test.wantOutput {
+				t.Fatalf("output = %q, want %q", output.String(), test.wantOutput)
+			}
+			if back != test.wantBack {
+				t.Fatalf("back = %v, want %v", back, test.wantBack)
+			}
+		})
 	}
 }
 

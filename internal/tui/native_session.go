@@ -1,25 +1,266 @@
 package tui
 
 import (
+	"errors"
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/term"
+	"github.com/creack/pty"
 	"github.com/majd/codex-agents/internal/appserver"
+	"github.com/muesli/cancelreader"
 )
 
-// nativeCodexCommand bypasses the overview's terminal-mode-filtering writer.
-// Codex performs a real TTY check on stdout and should negotiate its own modes
-// while it owns the terminal. Bubble Tea still supplies the live stdin stream.
+const nativeEscapeTimeout = 20 * time.Millisecond
+
+// nativeCodexCommand gives Codex a real pseudo-terminal and forwards its output
+// unchanged. The tiny input bridge reserves plain Left as the parent navigation
+// gesture; every other byte remains owned by native Codex.
 type nativeCodexCommand struct {
-	command *exec.Cmd
+	command       *exec.Cmd
+	input         io.Reader
+	backRequested atomic.Bool
 }
 
-func (c *nativeCodexCommand) Run() error               { return c.command.Run() }
-func (c *nativeCodexCommand) SetStdin(input io.Reader) { c.command.Stdin = input }
-func (c *nativeCodexCommand) SetStdout(io.Writer)      { c.command.Stdout = os.Stdout }
-func (c *nativeCodexCommand) SetStderr(io.Writer)      { c.command.Stderr = os.Stderr }
+func (c *nativeCodexCommand) SetStdin(input io.Reader) { c.input = input }
+func (c *nativeCodexCommand) SetStdout(io.Writer)      {}
+func (c *nativeCodexCommand) SetStderr(io.Writer)      {}
+
+func (c *nativeCodexCommand) Run() error {
+	if c.input == nil {
+		return errors.New("native Codex input is unavailable")
+	}
+
+	// Bubble Tea restores the parent terminal before Exec. Put only the parent
+	// input side back in raw mode so individual keys can be proxied to Codex's
+	// independently configured PTY slave.
+	var restoreInput func()
+	if inputFile, ok := c.input.(interface{ Fd() uintptr }); ok && term.IsTerminal(inputFile.Fd()) {
+		state, err := term.MakeRaw(inputFile.Fd())
+		if err != nil {
+			return err
+		}
+		restoreInput = func() { _ = term.Restore(inputFile.Fd(), state) }
+		defer restoreInput()
+	}
+
+	input, err := cancelreader.NewReader(c.input)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+
+	size, _ := pty.GetsizeFull(os.Stdout)
+	terminal, err := pty.StartWithSize(c.command, size)
+	if err != nil {
+		return err
+	}
+
+	resize := make(chan os.Signal, 1)
+	resizeDone := make(chan struct{})
+	signal.Notify(resize, syscall.SIGWINCH)
+	go func() {
+		for {
+			select {
+			case <-resize:
+				_ = pty.InheritSize(terminal, os.Stdout)
+			case <-resizeDone:
+				return
+			}
+		}
+	}()
+
+	outputDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(os.Stdout, terminal)
+		close(outputDone)
+	}()
+
+	inputDone := make(chan error, 1)
+	go func() {
+		inputDone <- bridgeNativeInput(input, terminal, func() {
+			c.backRequested.Store(true)
+			if c.command.Process != nil {
+				_ = c.command.Process.Signal(syscall.SIGTERM)
+			}
+		})
+	}()
+
+	waitErr := c.command.Wait()
+	input.Cancel()
+	_ = terminal.Close()
+	inputErr := <-inputDone
+	<-outputDone
+	signal.Stop(resize)
+	close(resizeDone)
+
+	if c.backRequested.Load() {
+		return nil
+	}
+	if waitErr != nil {
+		return waitErr
+	}
+	if inputErr != nil && !errors.Is(inputErr, cancelreader.ErrCanceled) && !errors.Is(inputErr, io.EOF) {
+		return inputErr
+	}
+	return nil
+}
+
+type nativeInputChunk struct {
+	data []byte
+	err  error
+}
+
+type nativeEscapeParser struct {
+	pending []byte
+}
+
+func (p *nativeEscapeParser) feed(value byte) (output []byte, back bool) {
+	if len(p.pending) == 0 {
+		if value == '\x1b' {
+			p.pending = append(p.pending, value)
+			return nil, false
+		}
+		return []byte{value}, false
+	}
+
+	if len(p.pending) == 1 {
+		if value == '[' || value == 'O' {
+			p.pending = append(p.pending, value)
+			return nil, false
+		}
+		output = append(output, p.pending...)
+		p.pending = p.pending[:0]
+		if value == '\x1b' {
+			p.pending = append(p.pending, value)
+			return output, false
+		}
+		return append(output, value), false
+	}
+
+	p.pending = append(p.pending, value)
+	if p.pending[1] == 'O' {
+		if len(p.pending) < 3 {
+			return nil, false
+		}
+		if len(p.pending) == 3 && value == 'D' {
+			p.pending = p.pending[:0]
+			return nil, true
+		}
+		return p.flush(), false
+	}
+
+	if value >= 0x40 && value <= 0x7e {
+		parameters := string(p.pending[2 : len(p.pending)-1])
+		if value == 'D' && (parameters == "" || parameters == "1" || parameters == "1;1") {
+			p.pending = p.pending[:0]
+			return nil, true
+		}
+		return p.flush(), false
+	}
+	if len(p.pending) > 32 {
+		return p.flush(), false
+	}
+	return nil, false
+}
+
+func (p *nativeEscapeParser) flush() []byte {
+	output := append([]byte(nil), p.pending...)
+	p.pending = p.pending[:0]
+	return output
+}
+
+func bridgeNativeInput(input io.Reader, output io.Writer, onBack func()) error {
+	chunks := make(chan nativeInputChunk, 1)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		buffer := make([]byte, 1024)
+		for {
+			count, err := input.Read(buffer)
+			chunk := nativeInputChunk{data: append([]byte(nil), buffer[:count]...), err: err}
+			select {
+			case chunks <- chunk:
+			case <-stop:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	parser := nativeEscapeParser{}
+	var timer *time.Timer
+	var timeout <-chan time.Time
+	resetTimer := func() {
+		if timer == nil {
+			timer = time.NewTimer(nativeEscapeTimeout)
+		} else {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(nativeEscapeTimeout)
+		}
+		timeout = timer.C
+	}
+	stopTimer := func() {
+		if timer != nil {
+			timer.Stop()
+		}
+		timeout = nil
+	}
+	defer stopTimer()
+
+	write := func(data []byte) error {
+		if len(data) == 0 {
+			return nil
+		}
+		_, err := output.Write(data)
+		return err
+	}
+
+	for {
+		select {
+		case chunk := <-chunks:
+			for _, value := range chunk.data {
+				data, back := parser.feed(value)
+				if err := write(data); err != nil {
+					return err
+				}
+				if back {
+					onBack()
+					return nil
+				}
+				if len(parser.pending) > 0 {
+					resetTimer()
+				} else {
+					stopTimer()
+				}
+			}
+			if chunk.err != nil {
+				if err := write(parser.flush()); err != nil {
+					return err
+				}
+				return chunk.err
+			}
+		case <-timeout:
+			if err := write(parser.flush()); err != nil {
+				return err
+			}
+			timeout = nil
+		}
+	}
+}
 
 // nativeSessionCommand deliberately invokes the installed Codex binary rather
 // than duplicating its renderer. unix:// selects the durable local App Server
