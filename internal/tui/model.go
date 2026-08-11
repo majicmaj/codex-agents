@@ -103,6 +103,7 @@ type Model struct {
 	transcriptHead      transcriptPoint
 	expandedTools       bool
 	transcript          *transcriptLayout
+	nativeSessions      bool
 }
 
 type eventMsg appserver.Event
@@ -156,6 +157,10 @@ type externalHistoryMsg struct {
 	thread appserver.Thread
 	err    error
 }
+type nativeSessionExitedMsg struct {
+	threadID string
+	err      error
+}
 
 func New(client *appserver.Client, cwd string, threads []appserver.Thread) Model {
 	return Model{
@@ -165,6 +170,14 @@ func New(client *appserver.Client, cwd string, threads []appserver.Thread) Model
 		turnStarted: make(map[string]time.Time), statusProbe: newSessionStatusProbe(),
 		transcript: newTranscriptLayout(),
 	}
+}
+
+// WithNativeSessions selects the production session renderer. The overview
+// stays in this process, while sessions temporarily own the terminal through
+// the installed Codex TUI connected to the same shared App Server daemon.
+func (m Model) WithNativeSessions(enabled bool) Model {
+	m.nativeSessions = enabled
+	return m
 }
 
 func (m Model) Init() tea.Cmd {
@@ -271,6 +284,17 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.mergeDiscoveredThreads(msg.threads)
 			m.selectThread(selectedID)
 		}
+	case nativeSessionExitedMsg:
+		m.loading = false
+		if msg.err != nil {
+			m.err = fmt.Errorf("native Codex session: %w", msg.err)
+			m.status = ""
+			break
+		}
+		m.status = "returned from native Codex"
+		m.selectThread(msg.threadID)
+		m.discovering = true
+		return m, discoverThreads(m.client)
 	case resumedMsg:
 		m.loading = false
 		if msg.err != nil {
@@ -768,8 +792,13 @@ func (m Model) openSelected() (tea.Model, tea.Cmd) {
 	if len(threads) == 0 || m.loading {
 		return m, nil
 	}
+	thread := threads[m.selected]
+	if m.nativeSessions {
+		m.loading, m.status = true, "opening native Codex"
+		return m, runNativeSession(thread)
+	}
 	m.loading, m.status = true, "loading session"
-	id := threads[m.selected].ID
+	id := thread.ID
 	return m, resumeThread(m.client, id, m.ownedThreads[id])
 }
 
@@ -784,6 +813,9 @@ func (m Model) startSession() (tea.Model, tea.Cmd) {
 	m.recordHistory(string(m.input))
 	m.clearInput()
 	m.loading, m.status = true, "starting session"
+	if m.nativeSessions {
+		return m, runNativeNewSession(m.cwd, prompt)
+	}
 	return m, startThread(m.client, m.cwd, prompt)
 }
 
@@ -1725,6 +1757,30 @@ func (m Model) ownershipNotice() string {
 }
 
 func (m Model) helpView() string {
+	if m.nativeSessions {
+		lines := []string{
+			bold + magenta + "Codex agents shortcuts" + reset,
+			"",
+			bold + "Overview" + reset,
+			"  ↑/↓ select · →/Enter open · g change grouping · Ctrl+R refresh",
+			"  Type a prompt and press Enter to start it in native Codex",
+			"  ←/→ or Ctrl+B/F move · Alt+B/F move by word · Home/End or Ctrl+A/E",
+			"  Shift+←/→ select · Alt+Backspace/Delete word · Ctrl+C clears input",
+			"  Ctrl+X twice within 3s closes the selected session subscription",
+			"  / commands · ? shortcuts · Ctrl+D quit · double Ctrl+C quits overview",
+			"",
+			bold + "Native session" + reset,
+			"  The installed Codex TUI owns all rendering, commands, and keybindings.",
+			"  /quit returns here and refreshes the overview.",
+			"  A session already open in standalone Codex must be closed there first.",
+			"",
+			dim + "Press ? or Esc to close" + reset,
+		}
+		if len(lines) > m.height {
+			lines = lines[:m.height]
+		}
+		return strings.Join(lines, "\n")
+	}
 	lines := []string{
 		bold + magenta + "Codex agents shortcuts" + reset,
 		"",

@@ -116,6 +116,8 @@ func main() {
 	doctor := flag.Bool("doctor", false, "verify Codex App Server connectivity and exit")
 	updateNow := flag.Bool("update", false, "install the latest GitHub release and exit")
 	noUpdate := flag.Bool("no-update", false, "skip the automatic daily update check")
+	nativeSessions := flag.Bool("native-sessions", true, "open sessions in the native Codex TUI (default)")
+	legacySessions := flag.Bool("legacy-sessions", false, "use the legacy built-in session renderer")
 	flag.Parse()
 	if *showVersion {
 		fmt.Printf("codex-agents %s\n", version)
@@ -167,8 +169,10 @@ func main() {
 		return
 	}
 
+	useNativeSessions := *nativeSessions && !*legacySessions && os.Getenv("CODEX_AGENTS_NATIVE_SESSIONS") != "0"
+	model := tui.New(client, tui.CurrentDirectory(), threads).WithNativeSessions(useNativeSessions)
 	program := tea.NewProgram(
-		tui.New(client, tui.CurrentDirectory(), threads),
+		model,
 		tea.WithOutput(&codexTerminalWriter{Writer: os.Stdout, terminal: os.Stdout, flags: codexKeyboardFlags()}),
 	)
 	// Match Codex's selection-safe wheel behavior: with mouse reporting off,

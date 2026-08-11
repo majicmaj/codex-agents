@@ -95,16 +95,30 @@ Verify connectivity without opening the TUI:
 codex-agents --doctor
 ```
 
-To use a native Codex TUI and Agents View on the same live session, launch the
-native client through the same local server:
+### Native Codex sessions
+
+Agents View owns only the lightweight project/session overview. Opening a
+session—or typing a new prompt in the overview—suspends that view and gives the
+terminal to the installed, unmodified Codex TUI. This preserves Codex rendering,
+syntax highlighting, slash commands, approvals, input behavior, and future CLI
+updates without maintaining a second transcript renderer.
+
+The native TUI connects to the durable local App Server with `--remote
+unix://`. `/quit` returns to Agents View and refreshes its session list. Other
+Codex clients can join the same daemon explicitly:
 
 ```sh
 codex --remote unix://
 codex resume --remote unix:// <session-id-or-name>
 ```
 
-Both clients then receive live events and can send input. Input sent while a
-turn is already working uses Codex's `turn/steer` protocol.
+Sessions already open in a separately launched Codex process have an active
+writer and cannot be taken over. Close that TUI first, then open the session
+from Agents View. Sessions launched from Agents View already use the shared
+daemon and resume normally.
+
+For rollback and comparison, `codex-agents --legacy-sessions` restores the old
+built-in Go session renderer. `CODEX_AGENTS_NATIVE_SESSIONS=0` does the same.
 
 New sessions use the directory where `codex-agents` was launched.
 Sessions beneath `~/Projects/<name>` are grouped under `<name>`; nested working
@@ -135,69 +149,27 @@ Overview:
 - New Codex sessions started after this view opens are discovered automatically
 - `Esc` exits
 
-Session:
+Native session:
 
-- `Enter` sends the prompt
-- `Shift+Enter` or `Alt+Enter` inserts a newline
-- `↑` / `↓` moves through multiline input, then cycles through past prompts at
-  the top/bottom boundary. The newest slot restores the unsent draft exactly,
-  including edits made while cycling
-- `PageUp` / `PageDown` or the mouse wheel scrolls conversation history;
-  `Home` / `End` jumps to top/bottom. Wheel events are captured and clamped, so
-  they cannot escape into shell scrollback
-- Drag selects and copies either composer input or visible transcript text
-  without background padding; OSC 52 plus native clipboard fallback keeps this
-  reliable across terminals, and selection remains virtualized while scrolling
-- `←` returns to the overview; `Esc` interrupts a working turn and otherwise returns
-- `Ctrl+C` clears a draft, or interrupts the active turn when input is empty
-- Press `Ctrl+X` twice within three seconds to close/unsubscribe this view from
-  the session. The first press temporarily replaces the session title with a
-  red confirmation; persisted history remains available for a later resume
-- `/rename <name>` updates the persisted session name without starting a turn
-
-Opening a stored session attempts `thread/resume` immediately on the shared
-daemon. A legacy Codex process launched without `--remote unix://` still owns a
-separate writer that cannot be safely taken over in place. Agents View shows the
-exact remote resume command for that exceptional case and keeps the draft intact.
-
-The conversation follows Codex's visual hierarchy: user messages use the
-subtle composer background, assistant text is unlabelled normal transcript
-text, and the user prompt associated with the visible turn stays pinned beneath
-the session header as history scrolls. The sticky prompt and bottom composer are
-both framed by full-width rules. Live commands and tools appear step by step,
-`Working (… • esc to interrupt)` stays above the composer, and Codex's timed
-`Worked for …` rule begins the completed work block.
-
-The composer follows Codex's default editing conventions: `Ctrl+B/F` moves by
-character, `Alt+B/F` by word, `Ctrl+A/E` to the line edges, `Ctrl+U/K` kills to
-the start/end, `Ctrl+Y` yanks, and `Ctrl+P/N` recalls history or navigates a
-completion popup. Long input wraps inside a padded, bottom-pinned composer.
+- Codex owns its complete keymap, composer, scrolling, selection, rendering,
+  slash-command palette, approvals, diffs, tools, and attachments
+- `/quit` exits the native session and returns to Agents View
+- `←` remains Codex's normal cursor-left key; it does not leave the session
+- The overview refreshes after Codex exits and keeps the same session selected
 
 ## Codex interaction compatibility
 
-The palette uses the upstream Codex command names and presentation order. The
-commands this overview can execute through its current App Server ownership are:
-`/new`, `/resume`, `/rename`, `/status`, `/stop`, `/clear`, `/help`, `/quit`, and `/exit`.
-Other Codex commands remain discoverable and are labelled **native Codex**;
-selecting one explains that it is not exposed here instead of sending it as an
-ordinary model prompt.
-
-URLs are underlined, clickable terminal hyperlinks in assistant messages.
-Existing local paths are highlighted and clickable; URLs and path-like tokens
-are highlighted while composing. Session activity includes commands, bounded
-command output, MCP/dynamic tools, and file-change steps from App Server events.
-Cross-process working, approval, and input states are inferred incrementally
-from Codex rollout task events because a separate App Server reports those
-threads as `notLoaded`.
+The session is the installed Codex CLI itself, so interaction compatibility
+tracks that installed version rather than a reimplementation in this project.
+The overview continues to infer cross-process `Working`, `Needs Input`, `Done`,
+and related states from App Server and rollout events.
 
 ## MVP limitations
 
-- Approval and structured-input requests are shown as **Needs input**, but must
-  currently be answered in the native Codex client.
 - Unread/Ready state is kept only for the current UI process.
-- Full diffs, native slash-command panels, image attachments, `@` file search,
-  `$` mentions, shell `!` mode, queued prompts, Vim mode, and configurable
-  keymaps remain available in native Codex.
+- Returning to Agents View uses `/quit`; left-arrow navigation would require an
+  upstream Codex keybinding because an external wrapper cannot distinguish it
+  from moving the composer cursor.
 
 The protocol integration follows the official OpenAI App Server documentation:
 https://developers.openai.com/codex/app-server
