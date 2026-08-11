@@ -1,16 +1,19 @@
 package appserver
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"net"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 type Status struct {
@@ -63,9 +66,18 @@ type rpcError struct {
 
 func (e *rpcError) Error() string { return fmt.Sprintf("app-server %d: %s", e.Code, e.Message) }
 
+var ErrActiveWriter = errors.New("thread already has an active writer")
+
+func IsActiveWriterError(err error) bool {
+	if errors.Is(err, ErrActiveWriter) {
+		return true
+	}
+	var rpcErr *rpcError
+	return errors.As(err, &rpcErr) && rpcErr.Code == -32600 && strings.Contains(rpcErr.Message, "already has an active writer")
+}
+
 type Client struct {
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
+	conn    *websocket.Conn
 	events  chan Event
 	pending map[string]chan rpcMessage
 	mu      sync.Mutex
@@ -76,42 +88,66 @@ type Client struct {
 	err     error
 }
 
-func Start(ctx context.Context) (*Client, error) {
+func Start(ctx context.Context, clientVersion string) (*Client, error) {
+	if clientVersion == "" {
+		clientVersion = "dev"
+	}
 	if _, err := exec.LookPath("codex"); err != nil {
 		return nil, errors.New("codex CLI was not found in PATH")
 	}
 
-	// One App Server owns every session while this overview is running. Using
-	// stdio keeps the MVP dependency-light and avoids polling or log scraping.
-	cmd := exec.CommandContext(ctx, "codex", "app-server", "--listen", "stdio://")
-	stdin, err := cmd.StdinPipe()
+	// Keep one durable App Server as the sole rollout writer, then attach this
+	// client through its Unix-socket WebSocket transport. Native Codex TUIs can
+	// attach to the same server with `--remote unix://`, so both surfaces can
+	// subscribe, steer, interrupt, and start turns without competing writer
+	// locks. Starting the daemon is idempotent.
+	startCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	startCommand := exec.CommandContext(startCtx, "codex", "app-server", "daemon", "start")
+	var startStderr bytes.Buffer
+	startCommand.Stderr = &startStderr
+	output, err := startCommand.Output()
 	if err != nil {
-		return nil, err
+		message := strings.TrimSpace(startStderr.String())
+		if message != "" {
+			return nil, fmt.Errorf("start shared app-server daemon: %w: %s", err, message)
+		}
+		return nil, fmt.Errorf("start shared app-server daemon: %w", err)
 	}
-	stdout, err := cmd.StdoutPipe()
+
+	var daemon struct {
+		SocketPath string `json:"socketPath"`
+	}
+	if err := json.Unmarshal(output, &daemon); err != nil {
+		return nil, fmt.Errorf("decode shared app-server address: %w", err)
+	}
+	if daemon.SocketPath == "" {
+		return nil, errors.New("shared app-server did not report its control socket")
+	}
+
+	dialer := websocket.Dialer{
+		NetDialContext: func(dialCtx context.Context, _, _ string) (net.Conn, error) {
+			var unixDialer net.Dialer
+			return unixDialer.DialContext(dialCtx, "unix", daemon.SocketPath)
+		},
+		HandshakeTimeout: 10 * time.Second,
+	}
+	conn, _, err := dialer.DialContext(ctx, "ws://localhost/", nil)
 	if err != nil {
-		return nil, err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, err
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start app-server proxy: %w", err)
+		return nil, fmt.Errorf("connect shared app-server at %s: %w", daemon.SocketPath, err)
 	}
 
 	c := &Client{
-		cmd: cmd, stdin: stdin, events: make(chan Event, 256),
+		conn: conn, events: make(chan Event, 256),
 		pending: make(map[string]chan rpcMessage), done: make(chan struct{}),
 	}
-	go c.readLoop(stdout)
-	go c.drainStderr(stderr)
+	go c.readLoop()
 
 	initCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	var initResult json.RawMessage
 	err = c.Request(initCtx, "initialize", map[string]any{
-		"clientInfo":   map[string]string{"name": "codex-agents", "version": "0.11.0"},
+		"clientInfo":   map[string]string{"name": "codex-agents", "version": clientVersion},
 		"capabilities": map[string]any{"experimentalApi": true},
 	}, &initResult)
 	if err != nil {
@@ -218,6 +254,18 @@ func (c *Client) StartTurn(ctx context.Context, threadID, text string) (Turn, er
 	return response.Turn, err
 }
 
+func (c *Client) SteerTurn(ctx context.Context, threadID, turnID, text string) (Turn, error) {
+	var response struct {
+		TurnID string `json:"turnId"`
+	}
+	err := c.Request(ctx, "turn/steer", map[string]any{
+		"threadId":       threadID,
+		"expectedTurnId": turnID,
+		"input":          []map[string]any{{"type": "text", "text": text}},
+	}, &response)
+	return Turn{ID: response.TurnID, Status: "inProgress"}, err
+}
+
 func (c *Client) InterruptTurn(ctx context.Context, threadID, turnID string) error {
 	var response json.RawMessage
 	return c.Request(ctx, "turn/interrupt", map[string]any{"threadId": threadID, "turnId": turnID}, &response)
@@ -290,19 +338,25 @@ func (c *Client) write(value any) error {
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	_, err = c.stdin.Write(append(data, '\n'))
-	return err
+	return c.conn.WriteMessage(websocket.TextMessage, data)
 }
 
-func (c *Client) readLoop(r io.Reader) {
-	scanner := bufio.NewScanner(r)
-	buffer := make([]byte, 64*1024)
-	scanner.Buffer(buffer, 16*1024*1024)
+func (c *Client) readLoop() {
 	defer close(c.done)
 	defer close(c.events)
-	for scanner.Scan() {
+	for {
+		messageType, payload, err := c.conn.ReadMessage()
+		if err != nil {
+			c.errMu.Lock()
+			c.err = err
+			c.errMu.Unlock()
+			return
+		}
+		if messageType != websocket.TextMessage {
+			continue
+		}
 		var msg rpcMessage
-		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+		if err := json.Unmarshal(payload, &msg); err != nil {
 			continue
 		}
 		if len(msg.ID) > 0 && msg.Method == "" {
@@ -322,15 +376,7 @@ func (c *Client) readLoop(r io.Reader) {
 			}
 		}
 	}
-	c.errMu.Lock()
-	c.err = scanner.Err()
-	if c.err == nil {
-		c.err = errors.New("app-server connection closed")
-	}
-	c.errMu.Unlock()
 }
-
-func (c *Client) drainStderr(r io.Reader) { _, _ = io.Copy(io.Discard, r) }
 
 func (c *Client) Err() error {
 	c.errMu.Lock()
@@ -342,9 +388,5 @@ func (c *Client) Err() error {
 }
 
 func (c *Client) Close() error {
-	_ = c.stdin.Close()
-	if c.cmd.Process != nil {
-		_ = c.cmd.Process.Kill()
-	}
-	return c.cmd.Wait()
+	return c.conn.Close()
 }

@@ -2,16 +2,70 @@
 
 A deliberately small session overview for Codex CLI.
 
-It runs one Codex App Server for every session in the overview, so sessions keep
-running when you move in and out of them. No tmux panes or transcript scraping
-are involved.
+It connects to Codex's durable local App Server daemon, so every session has one
+writer-owning server while Agents View and native Codex can both subscribe and
+write. Sessions keep running when you move in and out of them or close this UI.
+No tmux panes or transcript scraping are involved.
+
+## Install
+
+This repository is currently private, so authenticate GitHub CLI once and run
+the installer directly from the repository:
+
+```sh
+gh auth login
+gh api repos/majicmaj/codex-agents/contents/install.sh \
+  -H "Accept: application/vnd.github.raw+json" | sh
+```
+
+That installs the correct macOS or Linux binary in `~/.local/bin`. If needed,
+add it to your shell path:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Then launch it from any project:
+
+```sh
+codex-agents
+```
+
+Already cloned the repository? Run `./install.sh`. To use another destination,
+set `CODEX_AGENTS_INSTALL_DIR`, for example:
+
+```sh
+CODEX_AGENTS_INSTALL_DIR="$HOME/bin" ./install.sh
+```
+
+### Updates
+
+Installed release builds check GitHub once per day when they start. When a new
+release exists, `codex-agents` downloads the exact OS/architecture binary,
+verifies its SHA-256 checksum and GitHub asset digest, atomically replaces
+itself, and continues with the new version.
+
+Update immediately or disable automatic checks with:
+
+```sh
+codex-agents --update
+codex-agents --no-update
+CODEX_AGENTS_NO_UPDATE=1 codex-agents
+```
+
+Private-repository updates use the token from `GH_TOKEN`, `GITHUB_TOKEN`, or
+the existing `gh auth login` session. If the repository becomes public, the
+same installer and updater work without authentication.
 
 ## Requirements
 
 - Codex CLI with `codex app-server`
-- Go 1.25+ to build from source
+- GitHub CLI authenticated with repository access while the repo is private
+- macOS or Linux on Apple Silicon/ARM64 or Intel/AMD64
 
-## Run
+## Build from source
+
+Source builds require Go 1.25+:
 
 ```sh
 go run .
@@ -24,11 +78,33 @@ go build -o codex-agents .
 ./codex-agents
 ```
 
+Maintainers publish a version by pushing a semantic-version tag:
+
+```sh
+git tag v0.14.0
+git push origin main v0.14.0
+```
+
+The release workflow runs tests, builds all supported platforms, generates
+`SHA256SUMS`, and publishes the GitHub release. The binary version is derived
+from the tag, so there is no separate version file to keep synchronized.
+
 Verify connectivity without opening the TUI:
 
 ```sh
-./codex-agents --doctor
+codex-agents --doctor
 ```
+
+To use a native Codex TUI and Agents View on the same live session, launch the
+native client through the same local server:
+
+```sh
+codex --remote unix://
+codex resume --remote unix:// <session-id-or-name>
+```
+
+Both clients then receive live events and can send input. Input sent while a
+turn is already working uses Codex's `turn/steer` protocol.
 
 New sessions use the directory where `codex-agents` was launched.
 Sessions beneath `~/Projects/<name>` are grouped under `<name>`; nested working
@@ -63,10 +139,15 @@ Session:
 
 - `Enter` sends the prompt
 - `Shift+Enter` or `Alt+Enter` inserts a newline
-- `↑` / `↓`, `PageUp` / `PageDown`, or the mouse wheel scrolls conversation
-  history while the composer is empty; `Home` / `End` jumps to top/bottom
-- Native mouse drag selects visible transcript text; composer background padding
-  is painted without adding trailing spaces to copied text
+- `↑` / `↓` moves through multiline input, then cycles through past prompts at
+  the top/bottom boundary. The newest slot restores the unsent draft exactly,
+  including edits made while cycling
+- `PageUp` / `PageDown` or the mouse wheel scrolls conversation history;
+  `Home` / `End` jumps to top/bottom. Wheel events are captured and clamped, so
+  they cannot escape into shell scrollback
+- Drag selects and copies either composer input or visible transcript text
+  without background padding; OSC 52 plus native clipboard fallback keeps this
+  reliable across terminals, and selection remains virtualized while scrolling
 - `←` returns to the overview; `Esc` interrupts a working turn and otherwise returns
 - `Ctrl+C` clears a draft, or interrupts the active turn when input is empty
 - Press `Ctrl+X` twice within three seconds to close/unsubscribe this view from
@@ -74,12 +155,18 @@ Session:
   red confirmation; persisted history remains available for a later resume
 - `/rename <name>` updates the persisted session name without starting a turn
 
+Opening a stored session attempts `thread/resume` immediately on the shared
+daemon. A legacy Codex process launched without `--remote unix://` still owns a
+separate writer that cannot be safely taken over in place. Agents View shows the
+exact remote resume command for that exceptional case and keeps the draft intact.
+
 The conversation follows Codex's visual hierarchy: user messages use the
 subtle composer background, assistant text is unlabelled normal transcript
 text, and the user prompt associated with the visible turn stays pinned beneath
-the session header as history scrolls. Live commands and tools appear step by
-step, `Working (… • esc to interrupt)` stays above the composer, and completed
-work is separated from the final answer by Codex's timed `Worked for …` rule.
+the session header as history scrolls. The sticky prompt and bottom composer are
+both framed by full-width rules. Live commands and tools appear step by step,
+`Working (… • esc to interrupt)` stays above the composer, and Codex's timed
+`Worked for …` rule begins the completed work block.
 
 The composer follows Codex's default editing conventions: `Ctrl+B/F` moves by
 character, `Alt+B/F` by word, `Ctrl+A/E` to the line edges, `Ctrl+U/K` kills to
@@ -107,9 +194,6 @@ threads as `notLoaded`.
 
 - Approval and structured-input requests are shown as **Needs input**, but must
   currently be answered in the native Codex client.
-- Closing `codex-agents` stops turns owned by its App Server. A durable detached
-  supervisor is intentionally deferred until after the interaction loop is
-  proven.
 - Unread/Ready state is kept only for the current UI process.
 - Full diffs, native slash-command panels, image attachments, `@` file search,
   `$` mentions, shell `!` mode, queued prompts, Vim mode, and configurable

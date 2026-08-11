@@ -348,10 +348,77 @@ func TestArrowKeysStayInsideNonEmptyComposer(t *testing.T) {
 	}
 }
 
-func TestSessionViewLeavesMouseToNativeTranscriptSelection(t *testing.T) {
+func TestSessionArrowHistoryPreservesDraftAndEditedRecall(t *testing.T) {
+	m := Model{
+		mode: sessionMode, width: 30,
+		history: []string{"first prompt", "second prompt"}, historyIndex: 2,
+		input: []rune("unsent draft"), cursor: len([]rune("unsent draft")),
+	}
+	updated, _ := m.handleKey(tea.KeyPressMsg{Code: tea.KeyUp})
+	m = updated.(Model)
+	if got := string(m.input); got != "second prompt" {
+		t.Fatalf("up did not recall newest prompt: %q", got)
+	}
+	m.insertRunes([]rune(" edited"))
+	updated, _ = m.handleKey(tea.KeyPressMsg{Code: tea.KeyUp})
+	m = updated.(Model)
+	if got := string(m.input); got != "first prompt" {
+		t.Fatalf("second up did not recall older prompt: %q", got)
+	}
+	updated, _ = m.handleKey(tea.KeyPressMsg{Code: tea.KeyDown})
+	m = updated.(Model)
+	if got := string(m.input); got != "second prompt edited" {
+		t.Fatalf("down lost edits to recalled prompt: %q", got)
+	}
+	updated, _ = m.handleKey(tea.KeyPressMsg{Code: tea.KeyDown})
+	m = updated.(Model)
+	if got := string(m.input); got != "unsent draft" {
+		t.Fatalf("newest history slot lost unsent draft: %q", got)
+	}
+}
+
+func TestSessionArrowHistoryReturnsToEmptyNewestSlot(t *testing.T) {
+	m := Model{mode: sessionMode, width: 30, history: []string{"past prompt"}, historyIndex: 1}
+	updated, _ := m.handleKey(tea.KeyPressMsg{Code: tea.KeyUp})
+	m = updated.(Model)
+	if got := string(m.input); got != "past prompt" {
+		t.Fatalf("empty composer did not recall history: %q", got)
+	}
+	updated, _ = m.handleKey(tea.KeyPressMsg{Code: tea.KeyDown})
+	m = updated.(Model)
+	if len(m.input) != 0 || m.cursor != 0 {
+		t.Fatalf("down did not return to empty newest slot: %q at %d", string(m.input), m.cursor)
+	}
+}
+
+func TestOpeningExistingSessionLoadsPastPromptsIntoHistory(t *testing.T) {
+	m := Model{
+		ownedThreads: make(map[string]bool), writerBusy: make(map[string]bool),
+		unread: make(map[string]bool), activeTurns: make(map[string]string),
+		turnStarted: make(map[string]time.Time), statusProbe: newSessionStatusProbe(),
+		transcript: newTranscriptLayout(),
+	}
+	thread := appserver.Thread{ID: "thr", Turns: []appserver.Turn{
+		{ID: "one", Items: []json.RawMessage{json.RawMessage(`{"id":"u1","type":"userMessage","content":[{"type":"text","text":"older"}]}`)}},
+		{ID: "two", Items: []json.RawMessage{json.RawMessage(`{"id":"u2","type":"userMessage","content":[{"type":"text","text":"newer"}]}`)}},
+	}}
+	updated, _ := m.Update(resumedMsg{thread: thread, owned: true})
+	m = updated.(Model)
+	updated, _ = m.handleKey(tea.KeyPressMsg{Code: tea.KeyUp})
+	m = updated.(Model)
+	if got := string(m.input); got != "newer" {
+		t.Fatalf("opened session did not expose its prompt history: %q (history=%#v)", got, m.history)
+	}
+}
+
+func TestSessionViewCapturesWheelInsideIsolatedScreen(t *testing.T) {
 	m := Model{mode: sessionMode, width: 80, height: 20}
-	if got := m.View().MouseMode; got != tea.MouseModeNone {
-		t.Fatalf("mouse mode = %v, want none", got)
+	view := m.View()
+	if !view.AltScreen {
+		t.Fatal("session view did not isolate terminal scrollback")
+	}
+	if got := view.MouseMode; got != tea.MouseModeCellMotion {
+		t.Fatalf("mouse mode = %v, want cell motion", got)
 	}
 }
 
@@ -368,8 +435,8 @@ func TestOverviewToSessionPreservesBoundedStyledLayout(t *testing.T) {
 	m.scrollConversation(8)
 	view := m.View()
 	background, _ := composerBackgrounds()
-	if view.MouseMode != tea.MouseModeNone {
-		t.Fatalf("session transition retained overview mouse capture: %v", view.MouseMode)
+	if !view.AltScreen || view.MouseMode != tea.MouseModeCellMotion {
+		t.Fatalf("session transition lost bounded mouse capture: alt=%v mouse=%v", view.AltScreen, view.MouseMode)
 	}
 	if !strings.Contains(view.Content, background+"  keep this prompt pinned") {
 		t.Fatal("session transition lost the sticky prompt background")
@@ -379,6 +446,31 @@ func TestOverviewToSessionPreservesBoundedStyledLayout(t *testing.T) {
 	}
 	if got := strings.Count(view.Content, "\n"); got != m.height-1 {
 		t.Fatalf("session transition escaped its viewport: lines=%d want=%d", got, m.height-1)
+	}
+}
+
+func TestSessionMouseWheelCannotEscapeConversationBounds(t *testing.T) {
+	m := Model{
+		mode: sessionMode, sessionID: "thr", width: 48, height: 10,
+		threads:    []appserver.Thread{{ID: "thr", Cwd: "/tmp"}},
+		messages:   []chatMessage{{Role: "assistant", Text: strings.Repeat("scrollable line\n", 40)}},
+		transcript: newTranscriptLayout(),
+	}
+	for range 100 {
+		updated, _ := m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+		m = updated.(Model)
+	}
+	_, bodyRows := m.transcriptGeometry()
+	wantMax := max(0, m.ensureTranscriptLayout(m.threads[0]).totalRows()-bodyRows)
+	if m.scrollOffset != wantMax {
+		t.Fatalf("wheel exceeded upper conversation bound: offset=%d max=%d", m.scrollOffset, wantMax)
+	}
+	for range 100 {
+		updated, _ := m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+		m = updated.(Model)
+	}
+	if m.scrollOffset != 0 {
+		t.Fatalf("wheel exceeded lower conversation bound: offset=%d", m.scrollOffset)
 	}
 }
 
@@ -411,12 +503,12 @@ func TestOverviewCapturesAndBoundsMouseWheel(t *testing.T) {
 
 func TestMouseSelectionIsLimitedToComposerInput(t *testing.T) {
 	m := Model{mode: sessionMode, width: 30, height: 12, input: []rune("hello world"), cursor: 11}
-	// Three-row composer starts at row 8; its text row is row 9 and text starts at column 4.
-	updated, _ := m.Update(tea.MouseClickMsg{X: 4, Y: 9, Button: tea.MouseLeft})
+	// Five-row framed composer starts at row 6; its text row is row 8.
+	updated, _ := m.Update(tea.MouseClickMsg{X: 4, Y: 8, Button: tea.MouseLeft})
 	m = updated.(Model)
-	updated, _ = m.Update(tea.MouseMotionMsg{X: 9, Y: 9, Button: tea.MouseLeft})
+	updated, _ = m.Update(tea.MouseMotionMsg{X: 9, Y: 8, Button: tea.MouseLeft})
 	m = updated.(Model)
-	updated, cmd := m.Update(tea.MouseReleaseMsg{X: 9, Y: 9, Button: tea.MouseLeft})
+	updated, cmd := m.Update(tea.MouseReleaseMsg{X: 9, Y: 8, Button: tea.MouseLeft})
 	m = updated.(Model)
 	start, end, ok := m.selection()
 	if !ok || string(m.input[start:end]) != "hello" || cmd == nil {
@@ -424,8 +516,85 @@ func TestMouseSelectionIsLimitedToComposerInput(t *testing.T) {
 	}
 	updated, _ = m.Update(tea.MouseClickMsg{X: 4, Y: 2, Button: tea.MouseLeft})
 	m = updated.(Model)
-	if _, _, ok := m.selection(); ok || m.mouseSelecting {
+	if _, _, ok := m.selection(); ok || m.mouseSelecting || m.transcriptSelecting {
 		t.Fatal("transcript click created an application selection")
+	}
+}
+
+func TestConversationDragSelectsHighlightsAndCopiesWhileMouseStaysCaptured(t *testing.T) {
+	m := Model{
+		mode: sessionMode, sessionID: "thr", width: 80, height: 20,
+		threads:    []appserver.Thread{{ID: "thr", Cwd: "/tmp"}},
+		messages:   []chatMessage{{Role: "assistant", Text: "select this line"}},
+		transcript: newTranscriptLayout(),
+	}
+	updated, _ := m.Update(tea.MouseClickMsg{X: 2, Y: transcriptBodyTop, Button: tea.MouseLeft})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.MouseMotionMsg{X: 8, Y: transcriptBodyTop, Button: tea.MouseLeft})
+	m = updated.(Model)
+	if !m.transcriptSelecting || !m.transcriptSelected {
+		t.Fatal("conversation drag did not establish a live selection")
+	}
+	_, selectionBG := composerBackgrounds()
+	if view := m.sessionView(); !strings.Contains(view, selectionBG+"select") {
+		t.Fatalf("conversation selection was not visibly highlighted: %q", view)
+	}
+	updated, cmd := m.Update(tea.MouseReleaseMsg{X: 8, Y: transcriptBodyTop, Button: tea.MouseLeft})
+	m = updated.(Model)
+	selectedText := m.selectedTranscriptText()
+	if cmd == nil || m.transcriptSelecting || selectedText != "select" {
+		t.Fatalf("conversation selection did not copy cleanly: text=%q selecting=%v cmd=%v", selectedText, m.transcriptSelecting, cmd != nil)
+	}
+	if got := m.View().MouseMode; got != tea.MouseModeCellMotion {
+		t.Fatalf("selection disabled bounded wheel capture: %v", got)
+	}
+}
+
+func TestConversationSelectionPreservesCommandSyntaxStyles(t *testing.T) {
+	m := Model{
+		mode: sessionMode, sessionID: "thr", width: 120, height: 20,
+		threads: []appserver.Thread{{ID: "thr", Cwd: "/tmp"}},
+		messages: []chatMessage{{
+			Role: "activity", Kind: "command", Status: "completed",
+			Text: "go test -race ./internal/... && echo 'done'",
+		}},
+		transcript: newTranscriptLayout(),
+	}
+	layout := m.ensureTranscriptLayout(m.threads[0])
+	m.transcriptSelected = true
+	m.transcriptAnchor = transcriptPoint{row: 0, col: 0}
+	m.transcriptHead = transcriptPoint{row: 0, col: ansi.StringWidth(layout.rows(0, 1)[0])}
+	rendered := m.highlightTranscriptSelection(layout.rows(0, 1), 0)[0]
+	_, selectionBG := composerBackgrounds()
+	for _, style := range []string{selectionBG, shellCommand, shellFlag, shellString, shellOperator} {
+		if !strings.Contains(rendered, style) {
+			t.Fatalf("selected command lost style %q: %q", style, rendered)
+		}
+	}
+}
+
+func TestConversationSelectionUsesVirtualRowsAfterScrolling(t *testing.T) {
+	m := Model{
+		mode: sessionMode, sessionID: "thr", width: 40, height: 12,
+		threads:    []appserver.Thread{{ID: "thr", Cwd: "/tmp"}},
+		messages:   []chatMessage{{Role: "assistant", Text: strings.Repeat("virtual row\n", 60)}},
+		transcript: newTranscriptLayout(),
+	}
+	m.scrollConversation(18)
+	layout := m.ensureTranscriptLayout(m.threads[0])
+	start, _, _, _ := m.transcriptViewport(layout)
+	updated, _ := m.Update(tea.MouseClickMsg{X: 2, Y: transcriptBodyTop, Button: tea.MouseLeft})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.MouseMotionMsg{X: 9, Y: transcriptBodyTop, Button: tea.MouseLeft})
+	m = updated.(Model)
+	if m.transcriptAnchor.row != start || m.transcriptHead.row != start || m.selectedTranscriptText() != "virtual" {
+		t.Fatalf("scrolled selection lost its virtual row: start=%d anchor=%#v head=%#v text=%q", start, m.transcriptAnchor, m.transcriptHead, m.selectedTranscriptText())
+	}
+	before := m.scrollOffset
+	updated, _ = m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	m = updated.(Model)
+	if m.scrollOffset <= before {
+		t.Fatalf("selection broke bounded wheel scrolling: before=%d after=%d", before, m.scrollOffset)
 	}
 }
 
@@ -438,6 +607,45 @@ func TestMarkdownUsesCodexLikeStyles(t *testing.T) {
 	}
 	if !strings.Contains(got, bold+"now"+reset) || !strings.Contains(got, cyan+"threadId"+reset) || !strings.Contains(got, "\x1b]8;;https://example.com") {
 		t.Fatalf("expected Codex-like Markdown styles, got %q", got)
+	}
+}
+
+func TestCodeTabsRenderAsStableSpaces(t *testing.T) {
+	markdown := "```go\nfunc main() {\n\tif ready {\n\t\trun()\n\t}\n}\n```"
+	rendered := ansi.Strip(strings.Join(renderMarkdown(markdown, 80, "/tmp"), "\n"))
+	if strings.ContainsRune(rendered, '\t') {
+		t.Fatalf("raw tab escaped into rendered code: %q", rendered)
+	}
+	if !strings.Contains(rendered, "      if ready {") || !strings.Contains(rendered, "          run()") {
+		t.Fatalf("code indentation was not rendered at four spaces per tab: %q", rendered)
+	}
+	for _, row := range strings.Split(rendered, "\n") {
+		if ansi.StringWidth(row) > 80 {
+			t.Fatalf("tab-expanded code escaped its width: %q", row)
+		}
+	}
+}
+
+func TestCommandOutputAndDiffTabsRenderAsSpaces(t *testing.T) {
+	activity := renderActivity(chatMessage{Role: "activity", Kind: "command", Text: "printf", Detail: "one\ttwo"}, 80, "/tmp", true)
+	if got := ansi.Strip(strings.Join(activity, "\n")); strings.ContainsRune(got, '\t') || !strings.Contains(got, "one    two") {
+		t.Fatalf("command-output tab was not normalized: %q", got)
+	}
+	diff := renderDiffBody([]renderedDiffLine{{number: 1, kind: '+', text: "\treturn true"}}, "main.go", 80)
+	if got := ansi.Strip(strings.Join(diff, "\n")); strings.ContainsRune(got, '\t') || !strings.Contains(got, "    return true") {
+		t.Fatalf("diff tab was not normalized: %q", got)
+	}
+}
+
+func TestComposerTabRendersAsOneCellButPreservesInput(t *testing.T) {
+	m := Model{mode: sessionMode, width: 40, input: []rune("a\tb"), cursor: 3}
+	lines, _ := m.composer("message Codex…")
+	rendered := ansi.Strip(strings.Join(lines, "\n"))
+	if strings.ContainsRune(rendered, '\t') || !strings.Contains(rendered, "a b") {
+		t.Fatalf("composer tab did not render as a stable cell: %q", rendered)
+	}
+	if string(m.input) != "a\tb" {
+		t.Fatalf("composer rendering mutated input: %q", string(m.input))
 	}
 }
 
@@ -461,14 +669,104 @@ func (f *recordingTurnStarter) StartTurn(_ context.Context, id, text string) (ap
 	return appserver.Turn{ID: "turn_1"}, nil
 }
 
+func (f *recordingTurnStarter) SteerTurn(_ context.Context, id, turnID, text string) (appserver.Turn, error) {
+	f.calls = append(f.calls, "steer:"+id+":"+turnID+":"+text)
+	return appserver.Turn{ID: turnID}, nil
+}
+
 func TestHistoricalThreadIsResumedBeforeFirstSend(t *testing.T) {
 	fake := &recordingTurnStarter{}
-	message := sendTurn(fake, "thread_1", "hello", true)().(sentMsg)
+	message := sendTurn(fake, "thread_1", "", "hello", true, -1)().(sentMsg)
 	if got := strings.Join(fake.calls, ","); got != "resume:thread_1,start:thread_1:hello" {
 		t.Fatalf("wrong App Server call order: %s", got)
 	}
 	if message.err != nil || message.turnID != "turn_1" {
 		t.Fatalf("unexpected send result: %#v", message)
+	}
+}
+
+func TestInputDuringActiveTurnSteersInsteadOfStartingCompetingTurn(t *testing.T) {
+	fake := &recordingTurnStarter{}
+	message := sendTurn(fake, "thread_1", "turn_active", "more context", false, 3)().(sentMsg)
+	if got := strings.Join(fake.calls, ","); got != "steer:thread_1:turn_active:more context" {
+		t.Fatalf("active turn input used wrong App Server call: %s", got)
+	}
+	if message.err != nil || message.turnID != "turn_active" {
+		t.Fatalf("unexpected steer result: %#v", message)
+	}
+}
+
+type recordingThreadOpener struct {
+	calls     []string
+	resumeErr error
+	thread    appserver.Thread
+}
+
+func (f *recordingThreadOpener) ResumeThread(_ context.Context, id string) (appserver.Thread, error) {
+	f.calls = append(f.calls, "resume:"+id)
+	return f.thread, f.resumeErr
+}
+
+func (f *recordingThreadOpener) ReadThreadHistory(_ context.Context, id string) (appserver.Thread, error) {
+	f.calls = append(f.calls, "read:"+id)
+	return f.thread, nil
+}
+
+func TestOpeningThreadClaimsWriterBeforeShowingSession(t *testing.T) {
+	fake := &recordingThreadOpener{thread: appserver.Thread{ID: "thread_1"}}
+	message := resumeThread(fake, "thread_1", false)().(resumedMsg)
+	if got := strings.Join(fake.calls, ","); got != "resume:thread_1,read:thread_1" {
+		t.Fatalf("wrong open order: %s", got)
+	}
+	if message.err != nil || !message.owned || message.writerBusy {
+		t.Fatalf("thread was not claimed on open: %#v", message)
+	}
+}
+
+func TestOpeningExternallyOwnedThreadFallsBackToLiveReadOnlyHistory(t *testing.T) {
+	fake := &recordingThreadOpener{
+		thread: appserver.Thread{ID: "thread_1"}, resumeErr: appserver.ErrActiveWriter,
+	}
+	message := resumeThread(fake, "thread_1", false)().(resumedMsg)
+	if got := strings.Join(fake.calls, ","); got != "resume:thread_1,read:thread_1" {
+		t.Fatalf("writer conflict did not fall back to history: %s", got)
+	}
+	if message.err != nil || message.owned || !message.writerBusy || message.thread.ID != "thread_1" {
+		t.Fatalf("external writer state was not retained: %#v", message)
+	}
+}
+
+func TestWriterConflictRestoresOptimisticDraftWithoutGhostMessage(t *testing.T) {
+	m := Model{
+		mode: sessionMode, sessionID: "thread_1", width: 100, height: 14,
+		messages:   []chatMessage{{Role: "user", Text: "retry me"}},
+		writerBusy: make(map[string]bool), ownedThreads: map[string]bool{"thread_1": true},
+		transcript: newTranscriptLayout(),
+	}
+	updated, _ := m.Update(sentMsg{
+		threadID: "thread_1", text: "retry me", messageAt: 0, optimistic: true,
+		err: appserver.ErrActiveWriter,
+	})
+	m = updated.(Model)
+	if len(m.messages) != 0 || string(m.input) != "retry me" {
+		t.Fatalf("failed send left a ghost or lost draft: messages=%#v input=%q", m.messages, string(m.input))
+	}
+	if !m.writerBusy["thread_1"] || m.err != nil || !strings.Contains(ansi.Strip(m.ownershipNotice()), "--remote unix://") {
+		t.Fatalf("writer conflict was not explained cleanly: busy=%v err=%v notice=%q", m.writerBusy["thread_1"], m.err, m.ownershipNotice())
+	}
+}
+
+func TestSuccessfulOwnershipRetryDoesNotDuplicateEarlyUserEvent(t *testing.T) {
+	m := Model{
+		mode: sessionMode, sessionID: "thread_1", input: []rune("retry me"), cursor: 8,
+		messages:   []chatMessage{{ID: "user-event", Role: "user", Text: "retry me"}},
+		writerBusy: map[string]bool{"thread_1": true}, ownedThreads: make(map[string]bool),
+		activeTurns: make(map[string]string), turnStarted: make(map[string]time.Time),
+	}
+	updated, _ := m.Update(sentMsg{threadID: "thread_1", turnID: "turn_1", text: "retry me", messageAt: -1})
+	m = updated.(Model)
+	if len(m.messages) != 1 || len(m.input) != 0 || !m.ownedThreads["thread_1"] || m.writerBusy["thread_1"] {
+		t.Fatalf("ownership retry duplicated or retained stale state: messages=%#v input=%q owned=%v busy=%v", m.messages, string(m.input), m.ownedThreads["thread_1"], m.writerBusy["thread_1"])
 	}
 }
 
@@ -576,6 +874,9 @@ func TestActivitySeparatorAndWorkingStatus(t *testing.T) {
 	got := ansi.Strip(strings.Join(lines, "\n"))
 	if !strings.Contains(got, "Ran") || !strings.Contains(got, "go test ./...") || !strings.Contains(got, "Worked for 5m 17s") {
 		t.Fatalf("activity transcript is incomplete: %q", got)
+	}
+	if strings.Index(got, "Worked for 5m 17s") > strings.Index(got, "Ran") {
+		t.Fatalf("worked separator followed activity instead of starting its block: %q", got)
 	}
 	if status := m.workingStatus(); !strings.Contains(status, "Working") || !strings.Contains(status, "esc to interrupt") {
 		t.Fatalf("working status is incomplete: %q", status)
@@ -701,6 +1002,19 @@ func TestStickyPromptTracksScrolledTurn(t *testing.T) {
 	}
 	if !strings.Contains(second, "second") {
 		t.Fatalf("sticky prompt did not advance: %q", second)
+	}
+}
+
+func TestSessionComposerAndStickyPromptHaveRulesAboveAndBelow(t *testing.T) {
+	m := Model{mode: sessionMode, width: 40, input: []rune("hello"), cursor: 5}
+	composer, _ := m.composer("message Codex…")
+	rule := sessionRule(40)
+	if composer[0] != rule || composer[len(composer)-1] != rule {
+		t.Fatalf("composer frame is incomplete: %#v", composer)
+	}
+	sticky := strings.Split(stickyPrompt([]transcriptAnchor{{line: 0, text: "last prompt"}}, 0, 40), "\n")
+	if len(sticky) != 3 || sticky[0] != rule || sticky[2] != rule || !strings.Contains(sticky[1], "last prompt") {
+		t.Fatalf("sticky prompt frame is incomplete: %#v", sticky)
 	}
 }
 

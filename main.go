@@ -14,6 +14,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/majd/codex-agents/internal/appserver"
 	"github.com/majd/codex-agents/internal/tui"
+	"github.com/majd/codex-agents/internal/updater"
 )
 
 var version = "dev"
@@ -113,15 +114,41 @@ func codexKeyboardFlags() string {
 func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	doctor := flag.Bool("doctor", false, "verify Codex App Server connectivity and exit")
+	updateNow := flag.Bool("update", false, "install the latest GitHub release and exit")
+	noUpdate := flag.Bool("no-update", false, "skip the automatic daily update check")
 	flag.Parse()
 	if *showVersion {
 		fmt.Printf("codex-agents %s\n", version)
 		return
 	}
+	if *updateNow {
+		result, err := checkForUpdate(true)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "codex-agents: update: %v\n", err)
+			os.Exit(1)
+		}
+		if result.Updated {
+			fmt.Printf("updated codex-agents %s → %s\n", version, result.Version)
+		} else {
+			fmt.Printf("codex-agents %s is up to date\n", version)
+		}
+		return
+	}
+	if !*noUpdate && os.Getenv("CODEX_AGENTS_NO_UPDATE") != "1" {
+		result, err := checkForUpdate(false)
+		if err == nil && result.Updated {
+			fmt.Fprintf(os.Stderr, "codex-agents updated to %s\n", result.Version)
+			if err := replaceProcess(result.Executable); err != nil {
+				fmt.Fprintf(os.Stderr, "codex-agents: restart after update: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	client, err := appserver.Start(ctx)
+	client, err := appserver.Start(ctx, version)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "codex-agents: %v\n", err)
 		os.Exit(1)
@@ -153,4 +180,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "codex-agents: %v\n", runErr)
 		os.Exit(1)
 	}
+}
+
+func checkForUpdate(force bool) (updater.Result, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return updater.MaybeUpdate(ctx, updater.Options{CurrentVersion: version, Force: force})
 }

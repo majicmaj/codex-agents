@@ -52,46 +52,57 @@ type chatMessage struct {
 	Authorization  string
 }
 
+type transcriptPoint struct {
+	row int
+	col int
+}
+
 type Model struct {
-	client          *appserver.Client
-	cwd             string
-	threads         []appserver.Thread
-	selected        int
-	mode            mode
-	input           []rune
-	cursor          int
-	selectionAnchor int
-	hasSelection    bool
-	width           int
-	height          int
-	sessionID       string
-	messages        []chatMessage
-	recaps          map[string]string
-	unread          map[string]bool
-	loading         bool
-	status          string
-	err             error
-	groupByProject  bool
-	projectsRoot    string
-	lastEmptyCtrlC  time.Time
-	lastCtrlX       time.Time
-	popupSelected   int
-	history         []string
-	historyIndex    int
-	killBuffer      string
-	showHelp        bool
-	activeTurns     map[string]string
-	ownedThreads    map[string]bool
-	scrollOffset    int
-	turnStarted     map[string]time.Time
-	statusProbe     *sessionStatusProbe
-	externalStamp   string
-	externalReading bool
-	discovering     bool
-	lastDiscovery   time.Time
-	mouseSelecting  bool
-	expandedTools   bool
-	transcript      *transcriptLayout
+	client              *appserver.Client
+	cwd                 string
+	threads             []appserver.Thread
+	selected            int
+	mode                mode
+	input               []rune
+	cursor              int
+	selectionAnchor     int
+	hasSelection        bool
+	width               int
+	height              int
+	sessionID           string
+	messages            []chatMessage
+	recaps              map[string]string
+	unread              map[string]bool
+	loading             bool
+	status              string
+	err                 error
+	groupByProject      bool
+	projectsRoot        string
+	lastEmptyCtrlC      time.Time
+	lastCtrlX           time.Time
+	popupSelected       int
+	history             []string
+	historyIndex        int
+	historyBuffers      map[int][]rune
+	killBuffer          string
+	showHelp            bool
+	activeTurns         map[string]string
+	ownedThreads        map[string]bool
+	writerBusy          map[string]bool
+	scrollOffset        int
+	turnStarted         map[string]time.Time
+	statusProbe         *sessionStatusProbe
+	externalStamp       string
+	externalReading     bool
+	discovering         bool
+	lastDiscovery       time.Time
+	mouseSelecting      bool
+	transcriptSelecting bool
+	transcriptSelected  bool
+	transcriptAnchor    transcriptPoint
+	transcriptHead      transcriptPoint
+	expandedTools       bool
+	transcript          *transcriptLayout
 }
 
 type eventMsg appserver.Event
@@ -106,8 +117,10 @@ type discoveredThreadsMsg struct {
 	err     error
 }
 type resumedMsg struct {
-	thread appserver.Thread
-	err    error
+	thread     appserver.Thread
+	owned      bool
+	writerBusy bool
+	err        error
 }
 type startedMsg struct {
 	thread appserver.Thread
@@ -116,9 +129,12 @@ type startedMsg struct {
 	err    error
 }
 type sentMsg struct {
-	threadID string
-	turnID   string
-	err      error
+	threadID   string
+	turnID     string
+	text       string
+	messageAt  int
+	optimistic bool
+	err        error
 }
 type interruptedMsg struct{ err error }
 type renamedMsg struct {
@@ -145,7 +161,7 @@ func New(client *appserver.Client, cwd string, threads []appserver.Thread) Model
 	return Model{
 		client: client, cwd: cwd, threads: threads, unread: make(map[string]bool),
 		recaps:         make(map[string]string),
-		groupByProject: true, projectsRoot: defaultProjectsRoot(), activeTurns: make(map[string]string), ownedThreads: make(map[string]bool),
+		groupByProject: true, projectsRoot: defaultProjectsRoot(), activeTurns: make(map[string]string), ownedThreads: make(map[string]bool), writerBusy: make(map[string]bool),
 		turnStarted: make(map[string]time.Time), statusProbe: newSessionStatusProbe(),
 		transcript: newTranscriptLayout(),
 	}
@@ -261,12 +277,24 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = msg.err
 			break
 		}
+		m.clearTranscriptSelection()
 		m.sessionID = msg.thread.ID
+		if m.writerBusy == nil {
+			m.writerBusy = make(map[string]bool)
+		}
+		if msg.owned {
+			m.ownedThreads[msg.thread.ID] = true
+			delete(m.writerBusy, msg.thread.ID)
+		} else {
+			delete(m.ownedThreads, msg.thread.ID)
+			m.writerBusy[msg.thread.ID] = msg.writerBusy
+		}
 		m.lastCtrlX = time.Time{}
 		m.messages = messagesFromTurns(msg.thread.Turns)
 		if !m.ownedThreads[msg.thread.ID] {
 			m.messages = mergeRolloutReviews(m.messages, m.statusProbe.approvals(msg.thread.ID))
 		}
+		m.setPromptHistory(m.messages)
 		m.invalidateTranscript(0)
 		m.mode = sessionMode
 		m.unread[msg.thread.ID] = false
@@ -288,25 +316,55 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = msg.err
 			break
 		}
+		m.clearTranscriptSelection()
 		m.upsertThread(msg.thread)
 		m.sessionID = msg.thread.ID
 		m.lastCtrlX = time.Time{}
 		m.activeTurns[msg.thread.ID] = msg.turnID
 		m.turnStarted[msg.thread.ID] = time.Now()
 		m.ownedThreads[msg.thread.ID] = true
+		delete(m.writerBusy, msg.thread.ID)
 		m.messages = []chatMessage{{Role: "user", Text: msg.prompt}}
+		m.setPromptHistory(m.messages)
 		m.invalidateTranscript(0)
 		m.mode = sessionMode
 		m.scrollOffset = 0
 		m.status = ""
 	case sentMsg:
 		m.loading = false
+		if m.writerBusy == nil {
+			m.writerBusy = make(map[string]bool)
+		}
 		if msg.err != nil {
-			m.err = msg.err
+			if msg.optimistic {
+				m.removeOptimisticMessage(msg.messageAt, msg.text)
+				m.restoreDraft(msg.text)
+			}
+			if appserver.IsActiveWriterError(msg.err) {
+				m.writerBusy[msg.threadID] = true
+				delete(m.ownedThreads, msg.threadID)
+				m.status = ""
+				m.err = nil
+			} else {
+				m.err = msg.err
+			}
 		} else {
+			if !msg.optimistic {
+				m.recordHistory(msg.text)
+				if string(m.input) == msg.text {
+					m.clearInput()
+				}
+				if !m.hasUserMessage(msg.text) {
+					messageIndex := len(m.messages)
+					m.messages = append(m.messages, chatMessage{Role: "user", Text: msg.text})
+					m.invalidateTranscript(messageIndex)
+				}
+			}
 			m.activeTurns[msg.threadID] = msg.turnID
 			m.turnStarted[msg.threadID] = time.Now()
 			m.ownedThreads[msg.threadID] = true
+			delete(m.writerBusy, msg.threadID)
+			m.status = ""
 		}
 	case interruptedMsg:
 		if msg.err != nil {
@@ -329,9 +387,11 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.lastCtrlX = time.Time{}
 			delete(m.ownedThreads, msg.threadID)
+			delete(m.writerBusy, msg.threadID)
 			delete(m.activeTurns, msg.threadID)
 			delete(m.turnStarted, msg.threadID)
 			m.updateStatus(msg.threadID, appserver.Status{Type: "notLoaded"})
+			m.clearTranscriptSelection()
 			m.mode, m.sessionID, m.messages = listMode, "", nil
 			m.invalidateTranscript(0)
 			m.scrollOffset = 0
@@ -345,13 +405,22 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.MouseClickMsg:
 		if msg.Button == tea.MouseLeft && !m.showHelp {
 			if position, ok := m.composerPosition(msg.X, msg.Y, false); ok {
+				m.clearTranscriptSelection()
 				m.cursor = position
 				m.selectionAnchor = position
 				m.hasSelection = false
 				m.mouseSelecting = true
+			} else if point, ok := m.transcriptPointAt(msg.X, msg.Y, false); ok {
+				m.hasSelection = false
+				m.mouseSelecting = false
+				m.transcriptAnchor = point
+				m.transcriptHead = point
+				m.transcriptSelected = false
+				m.transcriptSelecting = true
 			} else {
 				m.hasSelection = false
 				m.mouseSelecting = false
+				m.clearTranscriptSelection()
 			}
 		}
 	case tea.MouseMotionMsg:
@@ -359,6 +428,11 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			if position, ok := m.composerPosition(msg.X, msg.Y, true); ok {
 				m.cursor = position
 				m.hasSelection = m.cursor != m.selectionAnchor
+			}
+		} else if m.transcriptSelecting {
+			if point, ok := m.transcriptPointAt(msg.X, msg.Y, true); ok {
+				m.transcriptHead = point
+				m.transcriptSelected = point != m.transcriptAnchor
 			}
 		}
 	case tea.MouseReleaseMsg:
@@ -369,7 +443,16 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.hasSelection = m.cursor != m.selectionAnchor
 			}
 			if start, end, ok := m.selection(); ok {
-				return m, tea.SetClipboard(string(m.input[start:end]))
+				return m, copyText(string(m.input[start:end]))
+			}
+		} else if m.transcriptSelecting {
+			m.transcriptSelecting = false
+			if point, ok := m.transcriptPointAt(msg.X, msg.Y, true); ok {
+				m.transcriptHead = point
+				m.transcriptSelected = point != m.transcriptAnchor
+			}
+			if text := m.selectedTranscriptText(); text != "" {
+				return m, copyText(text)
 			}
 		}
 	case tea.MouseWheelMsg:
@@ -544,6 +627,7 @@ func (m Model) handleKey(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		if len(m.input) == 0 {
 			m.lastCtrlX = time.Time{}
+			m.clearTranscriptSelection()
 			m.mode = listMode
 			m.sessionID = ""
 			m.messages = nil
@@ -553,6 +637,7 @@ func (m Model) handleKey(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "left":
 		if len(m.input) == 0 {
 			m.lastCtrlX = time.Time{}
+			m.clearTranscriptSelection()
 			m.mode = listMode
 			m.sessionID = ""
 			m.messages = nil
@@ -587,14 +672,18 @@ func (m Model) handleKey(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			if name, args, ok := parseSlashCommand(text); ok {
 				return m.runSlashCommand(name, args)
 			}
-			m.recordHistory(text)
-			m.clearInput()
-			messageIndex := len(m.messages)
-			m.messages = append(m.messages, chatMessage{Role: "user", Text: text})
-			m.invalidateTranscript(messageIndex)
 			m.scrollOffset = 0
 			m.loading = true
-			return m, sendTurn(m.client, m.sessionID, text, !m.ownedThreads[m.sessionID])
+			resume := !m.ownedThreads[m.sessionID]
+			messageIndex := -1
+			if !resume {
+				m.recordHistory(text)
+				m.clearInput()
+				messageIndex = len(m.messages)
+				m.messages = append(m.messages, chatMessage{Role: "user", Text: text})
+				m.invalidateTranscript(messageIndex)
+			}
+			return m, sendTurn(m.client, m.sessionID, m.activeTurns[m.sessionID], text, resume, messageIndex)
 		}
 	case "backspace", "shift+backspace", "ctrl+h":
 		m.backspace()
@@ -615,15 +704,23 @@ func (m Model) handleKey(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "alt+f", "alt+right", "ctrl+right":
 		m.moveWordForward()
 	case "up", "ctrl+p":
-		if len(m.input) > 0 {
-			m.moveCursorVertical(-1, max(1, m.width-6))
-		} else {
+		if m.moveCursorVertical(-1, max(1, m.width-6)) {
+			break
+		}
+		if m.recallHistory(-1) {
+			break
+		}
+		if len(m.history) == 0 {
 			m.scrollConversation(1)
 		}
 	case "down", "ctrl+n":
-		if len(m.input) > 0 {
-			m.moveCursorVertical(1, max(1, m.width-6))
-		} else {
+		if m.moveCursorVertical(1, max(1, m.width-6)) {
+			break
+		}
+		if m.recallHistory(1) {
+			break
+		}
+		if len(m.history) == 0 {
 			m.scrollConversation(-1)
 		}
 	case "pgup":
@@ -672,7 +769,8 @@ func (m Model) openSelected() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.loading, m.status = true, "loading session"
-	return m, resumeThread(m.client, threads[m.selected].ID)
+	id := threads[m.selected].ID
+	return m, resumeThread(m.client, id, m.ownedThreads[id])
 }
 
 func (m Model) startSession() (tea.Model, tea.Cmd) {
@@ -696,6 +794,7 @@ func (m Model) runSlashCommand(name, args string) (tea.Model, tea.Cmd) {
 	case "new":
 		if args == "" {
 			m.lastCtrlX = time.Time{}
+			m.clearTranscriptSelection()
 			m.mode, m.sessionID, m.messages = listMode, "", nil
 			m.invalidateTranscript(0)
 			m.status = "type a prompt to start a new session"
@@ -705,6 +804,7 @@ func (m Model) runSlashCommand(name, args string) (tea.Model, tea.Cmd) {
 		return m.startSession()
 	case "resume":
 		m.lastCtrlX = time.Time{}
+		m.clearTranscriptSelection()
 		m.mode, m.sessionID, m.messages = listMode, "", nil
 		m.invalidateTranscript(0)
 		m.status = "select a session to resume"
@@ -769,14 +869,28 @@ func discoverThreads(client *appserver.Client) tea.Cmd {
 	}
 }
 
-func resumeThread(client *appserver.Client, id string) tea.Cmd {
+type threadOpener interface {
+	ResumeThread(context.Context, string) (appserver.Thread, error)
+	ReadThreadHistory(context.Context, string) (appserver.Thread, error)
+}
+
+func resumeThread(client threadOpener, id string, alreadyOwned bool) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		// Reading history avoids taking ownership from another running Codex
-		// process. Sending a new turn still requires this App Server to own it.
+		owned, writerBusy := alreadyOwned, false
+		if !alreadyOwned {
+			if _, err := client.ResumeThread(ctx, id); err != nil {
+				if !appserver.IsActiveWriterError(err) {
+					return resumedMsg{err: err}
+				}
+				writerBusy = true
+			} else {
+				owned = true
+			}
+		}
 		thread, err := client.ReadThreadHistory(ctx, id)
-		return resumedMsg{thread, err}
+		return resumedMsg{thread: thread, owned: owned, writerBusy: writerBusy, err: err}
 	}
 }
 
@@ -806,19 +920,26 @@ func startThread(client *appserver.Client, cwd, prompt string) tea.Cmd {
 type turnStarter interface {
 	ResumeThread(context.Context, string) (appserver.Thread, error)
 	StartTurn(context.Context, string, string) (appserver.Turn, error)
+	SteerTurn(context.Context, string, string, string) (appserver.Turn, error)
 }
 
-func sendTurn(client turnStarter, id, text string, resume bool) tea.Cmd {
+func sendTurn(client turnStarter, id, activeTurnID, text string, resume bool, messageAt int) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if resume {
 			if _, err := client.ResumeThread(ctx, id); err != nil {
-				return sentMsg{threadID: id, err: err}
+				return sentMsg{threadID: id, text: text, messageAt: messageAt, optimistic: messageAt >= 0, err: err}
 			}
 		}
-		turn, err := client.StartTurn(ctx, id, text)
-		return sentMsg{threadID: id, turnID: turn.ID, err: err}
+		var turn appserver.Turn
+		var err error
+		if activeTurnID != "" {
+			turn, err = client.SteerTurn(ctx, id, activeTurnID, text)
+		} else {
+			turn, err = client.StartTurn(ctx, id, text)
+		}
+		return sentMsg{threadID: id, turnID: turn.ID, text: text, messageAt: messageAt, optimistic: messageAt >= 0, err: err}
 	}
 }
 
@@ -1080,6 +1201,16 @@ func (m *Model) mergeItems(items []json.RawMessage, turnID string, durationMS in
 }
 
 func (m *Model) mergeItemsWithStatus(items []json.RawMessage, turnID string, durationMS int64, status string) {
+	// Completion duration changes the separator rendered before this turn's
+	// first output, which may precede every item in the completion payload.
+	if durationMS > 0 {
+		for index, existing := range m.messages {
+			if existing.TurnID == turnID && existing.Role != "user" {
+				m.invalidateTranscript(index)
+				break
+			}
+		}
+	}
 	for _, item := range items {
 		message, ok := messageFromItem(item)
 		if !ok {
@@ -1115,6 +1246,40 @@ func (m *Model) mergeMessage(message chatMessage) {
 	messageIndex := len(m.messages)
 	m.messages = append(m.messages, message)
 	m.invalidateTranscript(messageIndex)
+}
+
+func (m *Model) removeOptimisticMessage(index int, text string) {
+	if index < 0 || index >= len(m.messages) {
+		return
+	}
+	message := m.messages[index]
+	if message.Role != "user" || message.ID != "" || message.Text != text {
+		return
+	}
+	m.messages = append(m.messages[:index], m.messages[index+1:]...)
+	m.invalidateTranscript(index)
+}
+
+func (m Model) hasUserMessage(text string) bool {
+	for i := len(m.messages) - 1; i >= 0; i-- {
+		if m.messages[i].Role == "user" {
+			return m.messages[i].Text == text
+		}
+	}
+	return false
+}
+
+func (m *Model) restoreDraft(text string) {
+	if text == "" {
+		return
+	}
+	if len(m.input) == 0 {
+		m.input = []rune(text)
+	} else {
+		m.input = append([]rune(text+"\n"), m.input...)
+	}
+	m.cursor = len(m.input)
+	m.hasSelection = false
 }
 
 func (m *Model) replaceMessages(messages []chatMessage) {
@@ -1412,10 +1577,12 @@ func (m Model) View() tea.View {
 		// above the alternate screen. The handler clamps them to list selection.
 		view.MouseMode = tea.MouseModeCellMotion
 	} else {
-		// In a session, leave mouse reporting disabled so the terminal owns native
-		// drag selection across transcript rows. Mode 1007 translates wheel events
-		// to bounded conversation navigation without making padding selectable.
-		view.MouseMode = tea.MouseModeNone
+		// Capture session wheel events explicitly. Some terminals ignore DECSET
+		// 1007 after a mouse-mode transition and scroll their primary history even
+		// while an alternate screen is active. Cell-motion mode makes the bounded
+		// transcript handler authoritative; Shift+drag remains the standard native
+		// terminal-selection escape hatch for transcript text.
+		view.MouseMode = tea.MouseModeCellMotion
 	}
 	view.KeyboardEnhancements.ReportAlternateKeys = true
 	return view
@@ -1509,21 +1676,20 @@ func (m *Model) sessionView() string {
 	composer, composerRows := m.composer("message Codex…")
 	popup, popupRows := m.commandPopup()
 	working := m.workingStatus()
+	ownership := m.ownershipNotice()
+	start, end, stickyStart, maxOffset := m.transcriptViewport(layout)
+	offset := min(m.scrollOffset, maxOffset)
+	visibleLines := layout.rows(start, end)
+	visibleLines = m.highlightTranscriptSelection(visibleLines, start)
 	workingRows := 0
 	if working != "" {
 		workingRows = 1
 	}
-	reservedRows := composerRows + popupRows + workingRows + 1
-	visible := max(1, m.height-reservedRows-2)
-	maxOffset := max(0, layout.totalRows()-visible)
-	offset := min(m.scrollOffset, maxOffset)
-	start := max(0, layout.totalRows()-visible-offset)
-	stickyStart := start
-	if promptStartsViewport(anchors, start) {
-		start++
+	ownershipRows := 0
+	if ownership != "" {
+		ownershipRows = 1
 	}
-	end := min(layout.totalRows(), start+visible)
-	visibleLines := layout.rows(start, end)
+	reservedRows := composerRows + popupRows + workingRows + ownershipRows + 1
 	var b strings.Builder
 	header := threadTitle(thread)
 	headerColor := ""
@@ -1538,13 +1704,24 @@ func (m *Model) sessionView() string {
 	writeLines(&b, visibleLines)
 	padToBottom(&b, m.height, reservedRows)
 	writeLines(&b, popup)
+	if ownership != "" {
+		b.WriteString(ownership)
+		b.WriteByte('\n')
+	}
 	if working != "" {
 		b.WriteString(working)
 		b.WriteByte('\n')
 	}
 	writeLines(&b, composer)
-	m.writeFooter(&b, joinFooter("↑↓/wheel scroll", "pgup/pgdn", "← back", "enter send", "ctrl+c interrupt", scrollStatus(offset, maxOffset)))
+	m.writeFooter(&b, joinFooter("↑↓/wheel scroll", "drag select/copy", "pgup/pgdn", "← back", "enter send", "ctrl+c interrupt", scrollStatus(offset, maxOffset)))
 	return b.String()
+}
+
+func (m Model) ownershipNotice() string {
+	if !m.writerBusy[m.sessionID] {
+		return ""
+	}
+	return red + "• Standalone Codex owns this thread • reopen it with: codex resume --remote unix:// " + m.sessionID + reset
 }
 
 func (m Model) helpView() string {
@@ -1560,7 +1737,9 @@ func (m Model) helpView() string {
 		bold + "Agent view" + reset,
 		"  ↑/↓ select · →/Enter open · ←/Esc back · g change grouping · Ctrl+R refresh",
 		"  Ctrl+X twice within 3s closes the open session; opening it later resumes it",
-		"  Ctrl+T expand/collapse tool output · mouse drag selects visible terminal text",
+		"  Shared writer: launch native sessions with `codex --remote unix://`",
+		"  Existing standalone session: reopen with `codex resume --remote unix:// <id>`",
+		"  Ctrl+T expand/collapse tool output · drag selects and copies transcript text",
 		"  / commands · ? shortcuts · Ctrl+D quit · double Ctrl+C quits overview",
 		"",
 		bold + "Command compatibility" + reset,
@@ -1760,6 +1939,7 @@ func wrap(text string, width int) []string {
 	if width < 1 {
 		return nil
 	}
+	text = expandTranscriptTabs(text)
 	var result []string
 	for _, paragraph := range strings.Split(text, "\n") {
 		if paragraph == "" {
@@ -1851,6 +2031,7 @@ func (m *Model) clearInput() {
 	m.hasSelection = false
 	m.popupSelected = 0
 	m.historyIndex = len(m.history)
+	m.historyBuffers = nil
 }
 
 func (m *Model) selection() (int, int, bool) {

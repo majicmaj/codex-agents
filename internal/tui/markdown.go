@@ -17,6 +17,7 @@ const (
 // punctuation disappears, code and links are cyan, and prose remains plain.
 func renderMarkdown(text string, width int, cwd string) []string {
 	width = max(1, width)
+	text = expandTranscriptTabs(text)
 	var result []string
 	inFence := false
 	for _, source := range strings.Split(text, "\n") {
@@ -41,6 +42,16 @@ func renderMarkdown(text string, width int, cwd string) []string {
 		return []string{""}
 	}
 	return result
+}
+
+// Match Codex's transcript normalization: raw tab controls interact badly
+// with gutters and terminal width accounting, so each tab has a stable
+// four-column representation before styling, wrapping, and virtualization.
+func expandTranscriptTabs(text string) string {
+	if !strings.ContainsRune(text, '\t') {
+		return text
+	}
+	return strings.ReplaceAll(text, "\t", "    ")
 }
 
 func markdownBlock(line string, inFence bool) (prefix, body, style string) {

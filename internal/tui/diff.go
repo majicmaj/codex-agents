@@ -79,6 +79,7 @@ func renderExplored(actions []commandAction, width int, cwd string) []string {
 		if i == 0 {
 			prefix = dim + "  └ " + reset
 		}
+		detail = expandTranscriptTabs(detail)
 		row := prefix + cyan + title + reset + " " + highlightText(detail, cwd)
 		lines = append(lines, strings.Split(ansi.Hardwrap(ansi.Wordwrap(row, width, ""), width, false), "\n")...)
 	}

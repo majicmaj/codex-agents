@@ -246,24 +246,50 @@ func (m *Model) recordHistory(text string) {
 		m.history = append(m.history, text)
 	}
 	m.historyIndex = len(m.history)
+	m.historyBuffers = nil
+}
+
+func (m *Model) setPromptHistory(messages []chatMessage) {
+	history := make([]string, 0, len(messages))
+	for _, message := range messages {
+		if message.Role != "user" || strings.TrimSpace(message.Text) == "" {
+			continue
+		}
+		history = append(history, message.Text)
+	}
+	m.history = history
+	m.historyIndex = len(history)
+	m.historyBuffers = nil
 }
 
 func (m *Model) recallHistory(delta int) bool {
 	if len(m.history) == 0 {
 		return false
 	}
+	if m.historyIndex < 0 || m.historyIndex > len(m.history) {
+		m.historyIndex = len(m.history)
+	}
 	next := max(0, min(len(m.history), m.historyIndex+delta))
 	if next == m.historyIndex {
 		return false
 	}
+	if m.historyBuffers == nil {
+		m.historyBuffers = make(map[int][]rune)
+	}
+	// Each history slot is an editable browsing buffer. This preserves both the
+	// unsent newest draft and edits made to recalled prompts while cycling.
+	m.historyBuffers[m.historyIndex] = append([]rune(nil), m.input...)
 	m.historyIndex = next
-	if next == len(m.history) {
-		m.clearInput()
+	if buffered, ok := m.historyBuffers[next]; ok {
+		m.input = append([]rune(nil), buffered...)
+	} else if next == len(m.history) {
+		m.input = nil
 	} else {
 		m.input = []rune(m.history[next])
-		m.cursor = len(m.input)
-		m.hasSelection = false
 	}
+	m.cursor = len(m.input)
+	m.hasSelection = false
+	m.popupSelected = 0
 	return true
 }
 
@@ -294,7 +320,10 @@ func (m Model) composer(placeholder string) ([]string, int) {
 	inputBG, selectionBG := composerBackgrounds()
 	start, end, selected := m.selection()
 	segments := composerSegments(m.input, innerWidth)
-	lines := make([]string, 0, len(segments)+2)
+	lines := make([]string, 0, len(segments)+4)
+	if m.mode == sessionMode {
+		lines = append(lines, sessionRule(m.width))
+	}
 	lines = append(lines, inputBG+eraseToEnd+reset)
 	for lineIndex, segment := range segments {
 		var b strings.Builder
@@ -318,7 +347,13 @@ func (m Model) composer(placeholder string) ([]string, int) {
 				if i == m.cursor {
 					b.WriteString("\x1b[7m")
 				}
-				b.WriteRune(m.input[i])
+				if m.input[i] == '\t' {
+					// Codex renders editable tabs as one cell so cursor and wrapping
+					// remain aligned while the underlying pasted text keeps its tab.
+					b.WriteRune(' ')
+				} else {
+					b.WriteRune(m.input[i])
+				}
 				if i == m.cursor {
 					b.WriteString("\x1b[27m")
 				}
@@ -336,6 +371,9 @@ func (m Model) composer(placeholder string) ([]string, int) {
 		lines = append(lines, b.String())
 	}
 	lines = append(lines, inputBG+eraseToEnd+reset)
+	if m.mode == sessionMode {
+		lines = append(lines, sessionRule(m.width))
+	}
 	return lines, len(lines)
 }
 
@@ -354,7 +392,11 @@ func (m Model) composerPosition(x, y int, clampOutside bool) (int, bool) {
 	if len(m.input) == 0 {
 		return 0, true
 	}
-	line := y - startY - 1
+	contentInset := 1
+	if m.mode == sessionMode {
+		contentInset++ // top rule precedes the existing background padding row
+	}
+	line := y - startY - contentInset
 	if line < 0 {
 		line = 0
 	}

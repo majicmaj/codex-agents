@@ -16,10 +16,9 @@ type transcriptAnchor struct {
 }
 
 type transcriptEntry struct {
-	start       int
-	lines       []string
-	anchor      string
-	workedAfter bool
+	start  int
+	lines  []string
+	anchor string
 }
 
 // transcriptLayout is a virtualized row index. Messages retain their rendered
@@ -66,18 +65,19 @@ func (m *Model) ensureTranscriptLayout(thread appserver.Thread) *transcriptLayou
 		from = min(len(layout.entries), len(m.messages))
 	}
 	from = min(from, min(len(layout.entries), len(m.messages)))
-	start, worked := 0, false
+	start := 0
 	if from > 0 {
 		previous := layout.entries[from-1]
 		start = previous.start + len(previous.lines)
-		worked = previous.workedAfter
 	}
+	separators := turnSeparatorStarts(m.messages)
 	layout.entries = layout.entries[:from]
 	anchorCount := sort.Search(len(layout.anchors), func(i int) bool { return layout.anchors[i].line >= start })
 	layout.anchors = layout.anchors[:anchorCount]
 	for i := from; i < len(m.messages); i++ {
-		lines, anchor, workedAfter := renderTranscriptEntry(m.messages[i], width, m.width, thread.Cwd, m.expandedTools, i > 0, worked)
-		entry := transcriptEntry{start: start, lines: lines, anchor: anchor, workedAfter: workedAfter}
+		duration, separated := separators[i]
+		lines, anchor := renderTranscriptEntry(m.messages[i], width, m.width, thread.Cwd, m.expandedTools, i > 0, separated, duration)
+		entry := transcriptEntry{start: start, lines: lines, anchor: anchor}
 		layout.entries = append(layout.entries, entry)
 		if anchor != "" {
 			anchorLine := start
@@ -87,7 +87,6 @@ func (m *Model) ensureTranscriptLayout(thread appserver.Thread) *transcriptLayou
 			layout.anchors = append(layout.anchors, transcriptAnchor{line: anchorLine, text: anchor})
 		}
 		start += len(lines)
-		worked = workedAfter
 	}
 	layout.dirtyFrom = -1
 	return layout
@@ -123,8 +122,8 @@ func (m Model) renderTranscript(thread appserver.Thread) ([]string, []transcript
 	var lines []string
 	var anchors []transcriptAnchor
 	width := max(20, m.width-4)
-	workedSinceUser := false
-	for _, message := range m.messages {
+	separators := turnSeparatorStarts(m.messages)
+	for index, message := range m.messages {
 		if message.Role == "user" {
 			wrapped := wrap(message.Text, width)
 			if len(wrapped) == 0 {
@@ -137,24 +136,23 @@ func (m Model) renderTranscript(thread appserver.Thread) ([]string, []transcript
 			for _, line := range wrapped {
 				lines = append(lines, userMessageLine("  "+line, m.width))
 			}
-			workedSinceUser = false
 			continue
 		}
-		if message.Role == "activity" {
+		duration, separated := separators[index]
+		if separated {
 			if len(lines) > 0 {
+				lines = append(lines, "")
+			}
+			lines = append(lines, turnSeparator(duration, m.width), "")
+		}
+		if message.Role == "activity" {
+			if len(lines) > 0 && !separated {
 				lines = append(lines, "")
 			}
 			lines = append(lines, renderActivity(message, width, thread.Cwd, m.expandedTools)...)
-			workedSinceUser = true
 			continue
 		}
-		if workedSinceUser && isFinalPhase(message.Phase) {
-			if len(lines) > 0 {
-				lines = append(lines, "")
-			}
-			lines = append(lines, turnSeparator(message.TurnDurationMS, m.width), "")
-			workedSinceUser = false
-		} else if len(lines) > 0 {
+		if len(lines) > 0 && !separated {
 			lines = append(lines, "")
 		}
 		rendered := renderMarkdown(message.Text, width, thread.Cwd)
@@ -169,7 +167,7 @@ func (m Model) renderTranscript(thread appserver.Thread) ([]string, []transcript
 	return lines, anchors
 }
 
-func renderTranscriptEntry(message chatMessage, width, screenWidth int, cwd string, expanded, hasPrevious, workedBefore bool) ([]string, string, bool) {
+func renderTranscriptEntry(message chatMessage, width, screenWidth int, cwd string, expanded, hasPrevious, separated bool, durationMS int64) ([]string, string) {
 	var lines []string
 	if message.Role == "user" {
 		wrapped := wrap(message.Text, width)
@@ -183,22 +181,22 @@ func renderTranscriptEntry(message chatMessage, width, screenWidth int, cwd stri
 		for _, line := range wrapped {
 			lines = append(lines, userMessageLine("  "+line, screenWidth))
 		}
-		return lines, anchor, false
+		return lines, anchor
+	}
+	if separated {
+		if hasPrevious {
+			lines = append(lines, "")
+		}
+		lines = append(lines, turnSeparator(durationMS, screenWidth), "")
 	}
 	if message.Role == "activity" {
-		if hasPrevious {
+		if hasPrevious && !separated {
 			lines = append(lines, "")
 		}
 		lines = append(lines, renderActivity(message, width, cwd, expanded)...)
-		return lines, "", true
+		return lines, ""
 	}
-	final := workedBefore && isFinalPhase(message.Phase)
-	if final {
-		if hasPrevious {
-			lines = append(lines, "")
-		}
-		lines = append(lines, turnSeparator(message.TurnDurationMS, screenWidth), "")
-	} else if hasPrevious {
+	if hasPrevious && !separated {
 		lines = append(lines, "")
 	}
 	for i, line := range renderMarkdown(message.Text, width, cwd) {
@@ -208,7 +206,46 @@ func renderTranscriptEntry(message chatMessage, width, screenWidth int, cwd stri
 		}
 		lines = append(lines, prefix+line)
 	}
-	return lines, "", workedBefore && !final
+	return lines, ""
+}
+
+// turnSeparatorStarts locates the first output row of each completed turn that
+// performed visible activity. Duration arrives with the completion payload, so
+// this look-ahead moves the rule to the start of the block while preserving the
+// independently cached entries used by virtualized scrolling.
+func turnSeparatorStarts(messages []chatMessage) map[int]int64 {
+	type turnBlock struct {
+		firstOutput int
+		durationMS  int64
+		hasActivity bool
+		completed   bool
+	}
+	blocks := make(map[string]turnBlock)
+	for index, message := range messages {
+		if message.TurnID == "" {
+			continue
+		}
+		block, exists := blocks[message.TurnID]
+		if !exists {
+			block.firstOutput = -1
+		}
+		if message.Role != "user" && block.firstOutput < 0 {
+			block.firstOutput = index
+		}
+		block.hasActivity = block.hasActivity || message.Role == "activity"
+		block.completed = block.completed || isFinalPhase(message.Phase)
+		if message.TurnDurationMS > block.durationMS {
+			block.durationMS = message.TurnDurationMS
+		}
+		blocks[message.TurnID] = block
+	}
+	starts := make(map[int]int64)
+	for _, block := range blocks {
+		if block.firstOutput >= 0 && block.hasActivity && block.completed {
+			starts[block.firstOutput] = block.durationMS
+		}
+	}
+	return starts
 }
 
 func isFinalPhase(phase string) bool {
@@ -216,6 +253,8 @@ func isFinalPhase(phase string) bool {
 }
 
 func renderActivity(message chatMessage, width int, cwd string, expanded bool) []string {
+	message.Text = expandTranscriptTabs(message.Text)
+	message.Detail = expandTranscriptTabs(message.Detail)
 	if message.Kind == "review" {
 		return renderReview(message, width, cwd)
 	}
@@ -395,8 +434,11 @@ func (m *Model) transcriptGeometry() (layout *transcriptLayout, bodyRows int) {
 	if m.workingStatus() != "" {
 		popupRows++
 	}
-	// Header, sticky prompt, composer, popup, and footer stay fixed.
-	bodyRows = max(1, m.height-(composerRows+popupRows+1)-2)
+	if m.ownershipNotice() != "" {
+		popupRows++
+	}
+	// Header, three-row sticky prompt, composer, popup, and footer stay fixed.
+	bodyRows = max(1, m.height-(composerRows+popupRows+1)-4)
 	return layout, bodyRows
 }
 
@@ -410,8 +452,9 @@ func (m *Model) scrollConversation(delta int) {
 }
 
 func stickyPrompt(anchors []transcriptAnchor, viewportStart int, width int) string {
+	rule := sessionRule(width)
 	if len(anchors) == 0 {
-		return dim + "  no user message" + reset
+		return rule + "\n" + dim + "  no user message" + reset + "\n" + rule
 	}
 	index := sort.Search(len(anchors), func(i int) bool { return anchors[i].line > viewportStart }) - 1
 	if index < 0 {
@@ -419,7 +462,11 @@ func stickyPrompt(anchors []transcriptAnchor, viewportStart int, width int) stri
 	}
 	selected := anchors[index]
 	text := truncate(clean(selected.text), max(8, width-6))
-	return userMessageLine("  "+text, width)
+	return rule + "\n" + userMessageLine("  "+text, width) + "\n" + rule
+}
+
+func sessionRule(width int) string {
+	return dim + strings.Repeat("─", max(1, width)) + reset
 }
 
 // promptStartsViewport reports whether the sticky prompt would otherwise be
