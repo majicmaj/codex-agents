@@ -1,0 +1,14 @@
+---
+source: tui/src/resume_picker.rs
+expression: "render_dashboard_list_snapshot(&state, 88, 12)"
+---
+/work/one  ─
+❯ 42s ago     [Needs Input] Short title
+/work/two  ─
+  10m ago     [Working]     A much longer title that still begins in the same column
+/work/three  ─
+  20m ago     [Idle]        Idle task
+/work/four  ─
+  30m ago     [Done]        Completed task
+/work/invocation  ─
+  -                         Start a new agent

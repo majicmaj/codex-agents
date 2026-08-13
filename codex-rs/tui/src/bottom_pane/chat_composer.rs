@@ -1512,6 +1512,10 @@ impl ChatComposer {
         self.draft.textarea.cursor() + if self.draft.is_bash_mode { 1 } else { 0 }
     }
 
+    pub(crate) fn cursor_at_start(&self) -> bool {
+        self.current_cursor() == 0
+    }
+
     #[cfg(test)]
     pub(crate) fn cursor(&self) -> usize {
         self.current_cursor()

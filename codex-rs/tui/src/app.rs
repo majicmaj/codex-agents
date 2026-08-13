@@ -208,7 +208,7 @@ mod agent_status_feed;
 mod app_server_event_targets;
 mod app_server_events;
 pub(crate) mod app_server_requests;
-mod background_requests;
+pub(crate) mod background_requests;
 mod config_persistence;
 mod event_dispatch;
 mod history_pagination;
@@ -218,7 +218,7 @@ mod loaded_threads;
 mod pending_interactive_replay;
 mod pets;
 mod platform_actions;
-mod plugin_mentions;
+pub(crate) mod plugin_mentions;
 mod replay_filter;
 mod resize_reflow;
 mod safety_buffering;
@@ -563,6 +563,7 @@ pub(crate) struct App {
     feedback_audience: FeedbackAudience,
     environment_manager: Arc<EnvironmentManager>,
     app_server_target: AppServerTarget,
+    agents_dashboard: bool,
     /// Set when the user confirms an update; propagated on exit.
     pub(crate) pending_update_action: Option<UpdateAction>,
 
@@ -788,6 +789,7 @@ impl App {
         is_first_run: bool,
         should_prompt_windows_sandbox_nux_at_startup: bool,
         app_server_target: AppServerTarget,
+        agents_dashboard: bool,
         state_db: Option<StateDbHandle>,
         environment_manager: Arc<EnvironmentManager>,
         startup_elapsed_before_app: Duration,
@@ -814,7 +816,10 @@ impl App {
         let bootstrap_ms = bootstrap.duration.as_millis();
         if matches!(
             &session_selection,
-            SessionSelection::StartFresh | SessionSelection::Exit
+            SessionSelection::StartFresh
+                | SessionSelection::StartFreshIn { .. }
+                | SessionSelection::Exit
+                | SessionSelection::ReconnectDashboard(_)
         ) {
             apply_managed_new_thread_defaults(
                 &mut config,
@@ -901,10 +906,15 @@ impl App {
         let thread_and_widget_started_at = Instant::now();
         let pending_startup_thread_start = matches!(
             &session_selection,
-            SessionSelection::StartFresh | SessionSelection::Exit
+            SessionSelection::StartFresh
+                | SessionSelection::StartFreshIn { .. }
+                | SessionSelection::Exit
+                | SessionSelection::ReconnectDashboard(_)
         );
         let (mut chat_widget, initial_started_thread) = match session_selection {
-            SessionSelection::StartFresh | SessionSelection::Exit => {
+            SessionSelection::StartFresh
+            | SessionSelection::Exit
+            | SessionSelection::ReconnectDashboard(_) => {
                 spawn_startup_thread_start(&app_server, config.clone(), app_event_tx.clone());
                 // Count a startup tooltip once the initial chat widget can render it.
                 let startup_tooltip_override =
@@ -921,6 +931,37 @@ impl App {
                         // CLI prompt args are plain strings, so they don't provide element ranges.
                         Vec::new(),
                     ),
+                    enhanced_keys_supported,
+                    has_chatgpt_account,
+                    has_codex_backend_auth,
+                    model_catalog: model_catalog.clone(),
+                    feedback: feedback.clone(),
+                    is_first_run,
+                    status_account_display: status_account_display.clone(),
+                    runtime_model_provider_base_url: runtime_model_provider_base_url.clone(),
+                    initial_plan_type,
+                    model: Some(model.clone()),
+                    startup_tooltip_override,
+                    status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
+                    terminal_title_invalid_items_warned: terminal_title_invalid_items_warned
+                        .clone(),
+                    session_telemetry: session_telemetry.clone(),
+                };
+                let mut chat_widget = ChatWidget::new_with_app_event(init);
+                chat_widget.set_queue_submissions_until_session_configured(/*queue*/ true);
+                (chat_widget, None)
+            }
+            SessionSelection::StartFreshIn { user_message, .. } => {
+                spawn_startup_thread_start(&app_server, config.clone(), app_event_tx.clone());
+                let startup_tooltip_override =
+                    prepare_startup_tooltip_override(&mut config, &available_models, is_first_run)
+                        .await;
+                let init = crate::chatwidget::ChatWidgetInit {
+                    config: config.clone(),
+                    frame_requester: tui.frame_requester(),
+                    app_event_tx: app_event_tx.clone(),
+                    workspace_command_runner: Some(workspace_command_runner.clone()),
+                    initial_user_message: Some(user_message),
                     enhanced_keys_supported,
                     has_chatgpt_account,
                     has_codex_backend_auth,
@@ -1072,6 +1113,7 @@ See the Codex keymap documentation for supported actions and examples."
             feedback_audience,
             environment_manager,
             app_server_target,
+            agents_dashboard,
             pending_update_action: None,
             pending_shutdown_exit_thread_id: None,
             windows_sandbox: WindowsSandboxState::default(),

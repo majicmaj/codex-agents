@@ -830,7 +830,7 @@ pub(super) async fn send_add_credits_nudge_email(
     Ok(response.status)
 }
 
-pub(super) async fn fetch_skills_list(
+pub(crate) async fn fetch_skills_list(
     request_handle: AppServerRequestHandle,
     cwd: PathBuf,
 ) -> Result<SkillsListResponse> {
@@ -849,7 +849,7 @@ pub(super) async fn fetch_skills_list(
         .wrap_err("skills/list failed in TUI")
 }
 
-pub(super) async fn fetch_connectors_list(
+pub(crate) async fn fetch_connectors_list(
     request_handle: AppServerRequestHandle,
     force_refetch: bool,
     thread_id: Option<String>,

@@ -1357,6 +1357,10 @@ impl BottomPane {
         self.composer.is_empty()
     }
 
+    pub(crate) fn composer_cursor_at_start(&self) -> bool {
+        self.composer.cursor_at_start()
+    }
+
     #[cfg(test)]
     pub(crate) fn composer_is_vim_enabled(&self) -> bool {
         self.composer.is_vim_enabled()

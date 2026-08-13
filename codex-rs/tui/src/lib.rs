@@ -113,6 +113,7 @@ mod pets;
 pub use custom_terminal::Terminal;
 mod auto_review_denials;
 mod cwd_prompt;
+mod dashboard;
 mod debug_config;
 mod diff_model;
 mod diff_render;
@@ -516,6 +517,59 @@ pub(crate) async fn start_app_server_for_picker(
     ))
 }
 
+pub(crate) async fn reconnect_app_server_for_dashboard(
+    config: &Config,
+    target: &AppServerTarget,
+    state_db: Option<StateDbHandle>,
+    environment_manager: Arc<EnvironmentManager>,
+) -> color_eyre::Result<AppServerSession> {
+    const RETRY_DELAYS: [Duration; 3] = [
+        Duration::from_millis(100),
+        Duration::from_millis(250),
+        Duration::from_millis(500),
+    ];
+
+    let mut last_error = None;
+    for delay in RETRY_DELAYS {
+        match start_app_server_for_picker(
+            config,
+            target,
+            state_db.clone(),
+            environment_manager.clone(),
+        )
+        .await
+        {
+            Ok(app_server) => return Ok(app_server),
+            Err(err) => {
+                last_error = Some(err);
+                #[cfg(unix)]
+                if matches!(target, AppServerTarget::LocalDaemon { .. })
+                    && let Err(err) = codex_app_server_daemon::bootstrap(
+                        codex_app_server_daemon::BootstrapOptions {
+                            remote_control_enabled: false,
+                        },
+                    )
+                    .await
+                {
+                    tracing::warn!(%err, "failed to re-bootstrap agents dashboard daemon");
+                }
+            }
+        }
+        tokio::time::sleep(delay).await;
+    }
+
+    start_app_server_for_picker(config, target, state_db, environment_manager)
+        .await
+        .map_err(|err| {
+            let first_error = last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| String::from("connection closed"));
+            err.wrap_err(format!(
+                "dashboard reconnect attempts failed (first error: {first_error})"
+            ))
+        })
+}
+
 #[cfg(test)]
 pub(crate) async fn start_embedded_app_server_for_picker(
     config: &Config,
@@ -773,6 +827,9 @@ async fn resolve_startup_resume_or_fork_cwd(
         resume_picker::SessionSelection::Fork(target_session) => {
             Some((CwdPromptAction::Fork, target_session))
         }
+        resume_picker::SessionSelection::StartFreshIn { cwd, .. } => {
+            return Ok(ResolveCwdOutcome::Continue(Some(cwd.clone())));
+        }
         _ => None,
     }) else {
         return Ok(ResolveCwdOutcome::Continue(None));
@@ -939,12 +996,13 @@ pub async fn run_main(
         launch_loader_overrides.user_config_path = Some(user_config_path);
         launch_loader_overrides.user_config_profile = Some(profile_v2.clone());
     }
-    let reuse_implicit_local_daemon = can_reuse_implicit_local_daemon(
-        &cli_kv_overrides,
-        &launch_loader_overrides,
-        strict_config,
-        cli.bypass_hook_trust,
-    );
+    let reuse_implicit_local_daemon = cli.agents_dashboard
+        || can_reuse_implicit_local_daemon(
+            &cli_kv_overrides,
+            &launch_loader_overrides,
+            strict_config,
+            cli.bypass_hook_trust,
+        );
     let default_daemon = if explicit_remote_endpoint.is_none() && reuse_implicit_local_daemon {
         maybe_probe_default_daemon_socket(&codex_home).await
     } else {
@@ -1272,7 +1330,7 @@ pub async fn run_main(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_ratatui_app(
-    cli: Cli,
+    mut cli: Cli,
     arg0_paths: Arg0DispatchPaths,
     loader_overrides: LoaderOverrides,
     strict_config: bool,
@@ -1288,6 +1346,11 @@ async fn run_ratatui_app(
     state_db: Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
 ) -> color_eyre::Result<AppExitInfo> {
+    let mut dashboard_initial_draft = if cli.agents_dashboard {
+        cli.prompt.take()
+    } else {
+        None
+    };
     let uses_remote_workspace = app_server_target.uses_remote_workspace();
     color_eyre::install()?;
 
@@ -1567,18 +1630,40 @@ async fn run_ratatui_app(
             None => resume_picker::SessionSelection::StartFresh,
         }
     } else if cli.resume_picker {
-        let Some(app_server) = app_server.take() else {
+        let Some(mut picker_app_server) = app_server.take() else {
             unreachable!("app server should be initialized for --resume picker");
         };
-        match resume_picker::run_resume_picker_with_app_server(
-            &mut tui,
-            &config,
-            cli.resume_show_all,
-            cli.resume_include_non_interactive,
-            app_server,
-        )
-        .await?
-        {
+        let selection = if cli.agents_dashboard {
+            let mut dashboard_resume_state =
+                resume_picker::DashboardResumeState::with_draft(dashboard_initial_draft.take());
+            loop {
+                let selection =
+                    dashboard::run(&mut tui, &config, picker_app_server, dashboard_resume_state)
+                        .await?;
+                dashboard_resume_state = match selection {
+                    resume_picker::SessionSelection::ReconnectDashboard(state) => state,
+                    selection => break selection,
+                };
+                picker_app_server = reconnect_app_server_for_dashboard(
+                    &config,
+                    &app_server_target,
+                    state_db.clone(),
+                    environment_manager.clone(),
+                )
+                .await
+                .wrap_err("failed to reconnect the agents dashboard")?;
+            }
+        } else {
+            resume_picker::run_resume_picker_with_app_server(
+                &mut tui,
+                &config,
+                cli.resume_show_all,
+                cli.resume_include_non_interactive,
+                picker_app_server,
+            )
+            .await?
+        };
+        match selection {
             resume_picker::SessionSelection::Exit => {
                 terminal_restore_guard.restore_silently();
                 session_log::log_session_end();
@@ -1589,6 +1674,9 @@ async fn run_ratatui_app(
                     update_action: None,
                     exit_reason: ExitReason::UserRequested,
                 });
+            }
+            resume_picker::SessionSelection::ReconnectDashboard(_) => {
+                unreachable!("dashboard reconnect is handled before startup selection")
             }
             other => other,
         }
@@ -1633,7 +1721,9 @@ async fn run_ratatui_app(
     ) && (cli.resume_picker || cli.fork_picker);
 
     let mut config = match &session_selection {
-        resume_picker::SessionSelection::Resume(_) | resume_picker::SessionSelection::Fork(_) => {
+        resume_picker::SessionSelection::Resume(_)
+        | resume_picker::SessionSelection::Fork(_)
+        | resume_picker::SessionSelection::StartFreshIn { .. } => {
             load_config_or_exit_with_fallback_cwd(
                 cli_kv_overrides.clone(),
                 overrides.clone(),
@@ -1653,6 +1743,9 @@ async fn run_ratatui_app(
                 strict_config,
             )
             .await
+        }
+        resume_picker::SessionSelection::ReconnectDashboard(_) => {
+            unreachable!("dashboard reconnect is handled before loading session config")
         }
         _ => config,
     };
@@ -1773,6 +1866,7 @@ async fn run_ratatui_app(
         should_show_trust_screen, // Proxy to: is it a first run in this directory?
         should_prompt_windows_sandbox_nux_at_startup,
         app_server_target,
+        cli.agents_dashboard,
         state_db,
         environment_manager,
         startup_elapsed_before_app,
@@ -2342,6 +2436,84 @@ mod tests {
             error.to_string(),
             "`tui.resume_cwd = \"current\"` requires `--cd` when using a remote workspace"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_dashboard_submission_uses_selected_project_cwd() -> color_eyre::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let selected_cwd = temp_dir.path().join("selected-project");
+        std::fs::create_dir_all(&selected_cwd)?;
+        let config = ConfigBuilder::default()
+            .codex_home(temp_dir.path().to_path_buf())
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+            .build()
+            .await?;
+        let mut tui = tui::test_support::make_test_tui()?;
+        let session_selection = resume_picker::SessionSelection::StartFreshIn {
+            cwd: selected_cwd.clone(),
+            user_message: crate::chatwidget::UserMessage::from("Build the dashboard"),
+        };
+
+        let resolved = resolve_startup_resume_or_fork_cwd(
+            &mut tui,
+            &config,
+            /*state_db*/ None,
+            &session_selection,
+            /*cwd_override*/ None,
+            /*uses_remote_workspace*/ false,
+            /*uses_remote_workspace_or_environment*/ false,
+        )
+        .await?;
+
+        assert_eq!(resolved, ResolveCwdOutcome::Continue(Some(selected_cwd)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dashboard_selected_project_starts_app_server_thread_in_that_cwd()
+    -> color_eyre::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let selected_cwd = temp_dir.path().join("selected-project");
+        std::fs::create_dir_all(&selected_cwd)?;
+        let base_config = ConfigBuilder::default()
+            .codex_home(temp_dir.path().to_path_buf())
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+            .build()
+            .await?;
+        let mut tui = tui::test_support::make_test_tui()?;
+        let selection = resume_picker::SessionSelection::StartFreshIn {
+            cwd: selected_cwd.clone(),
+            user_message: crate::chatwidget::UserMessage::from("Build the dashboard"),
+        };
+        let fallback_cwd = match resolve_startup_resume_or_fork_cwd(
+            &mut tui,
+            &base_config,
+            /*state_db*/ None,
+            &selection,
+            /*cwd_override*/ None,
+            /*uses_remote_workspace*/ false,
+            /*uses_remote_workspace_or_environment*/ false,
+        )
+        .await?
+        {
+            ResolveCwdOutcome::Continue(cwd) => cwd,
+            ResolveCwdOutcome::Exit => panic!("dashboard selection should continue"),
+        };
+        let selected_config = ConfigBuilder::default()
+            .codex_home(temp_dir.path().to_path_buf())
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+            .fallback_cwd(fallback_cwd)
+            .build()
+            .await?;
+        let mut app_server = start_embedded_app_server_for_picker(&selected_config).await?;
+
+        let started = app_server.start_thread(&selected_config).await?;
+        assert!(!session_resume::cwds_differ(
+            started.session.cwd.as_path(),
+            &selected_cwd,
+        ));
+        app_server.shutdown().await?;
         Ok(())
     }
 

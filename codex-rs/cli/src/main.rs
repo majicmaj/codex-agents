@@ -37,6 +37,7 @@ use codex_utils_cli::ProfileV2Name;
 use codex_utils_cli::SharedCliOptions;
 use owo_colors::OwoColorize;
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::io::Write;
 use std::path::PathBuf;
@@ -123,6 +124,9 @@ struct MultitoolCli {
 
 #[derive(Debug, clap::Subcommand)]
 enum Subcommand {
+    /// Open the multi-session agents dashboard.
+    Agents(AgentsCommand),
+
     /// Run Codex non-interactively.
     #[clap(visible_alias = "e")]
     Exec(ExecCli),
@@ -213,6 +217,12 @@ enum Subcommand {
 
     /// Inspect feature flags.
     Features(FeaturesCli),
+}
+
+#[derive(Debug, Parser)]
+struct AgentsCommand {
+    #[clap(flatten)]
+    config_overrides: TuiCli,
 }
 
 #[derive(Debug, Parser)]
@@ -994,7 +1004,7 @@ async fn cli_main(
         remote,
         mut interactive,
         subcommand,
-    } = MultitoolCli::parse();
+    } = parse_multitool_cli(std::env::args_os()).unwrap_or_else(|err| err.exit());
     // Fold --enable/--disable into config overrides so they flow to all subcommands.
     let toggle_overrides = feature_toggles.to_overrides()?;
     root_config_overrides.raw_overrides.extend(toggle_overrides);
@@ -1304,6 +1314,47 @@ async fn cli_main(
             )
             .await?;
             handle_app_exit(exit_info)?;
+        }
+        Some(Subcommand::Agents(AgentsCommand { config_overrides })) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "agents",
+            )?;
+            #[cfg(not(unix))]
+            anyhow::bail!("`codex agents` is currently supported on macOS and Linux only");
+
+            #[cfg(unix)]
+            {
+                codex_app_server_daemon::bootstrap(AppServerBootstrapOptions {
+                    remote_control_enabled: false,
+                })
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "failed to start the shared Codex app-server daemon: {err:#}\n\
+                         Install or update the standalone Codex CLI, then retry `codex agents`."
+                    )
+                })?;
+
+                let agents_cli = config_overrides;
+                interactive.agents_dashboard = true;
+                interactive.resume_picker = true;
+                interactive.resume_show_all = true;
+                merge_interactive_cli_flags(&mut interactive, agents_cli);
+                prepend_config_flags(
+                    &mut interactive.config_overrides,
+                    root_config_overrides.clone(),
+                );
+                let exit_info = run_interactive_tui(
+                    interactive,
+                    root_remote.clone(),
+                    root_remote_auth_token_env.clone(),
+                    arg0_paths.clone(),
+                )
+                .await?;
+                handle_app_exit(exit_info)?;
+            }
         }
         Some(Subcommand::Archive(cmd)) => {
             let output = run_session_archive_cli_command(
@@ -1695,6 +1746,20 @@ async fn cli_main(
     Ok(())
 }
 
+fn parse_multitool_cli(
+    args: impl IntoIterator<Item = OsString>,
+) -> Result<MultitoolCli, clap::Error> {
+    let mut args = args.into_iter().collect::<Vec<_>>();
+    let is_agents_alias = args
+        .first()
+        .and_then(|arg0| PathBuf::from(arg0).file_name().map(ToOwned::to_owned))
+        .is_some_and(|name| name == "codex-agents");
+    if is_agents_alias {
+        args.insert(1, OsString::from("agents"));
+    }
+    MultitoolCli::try_parse_from(args)
+}
+
 fn profile_v2_for_subcommand<'a>(
     interactive: &'a TuiCli,
     subcommand: &Subcommand,
@@ -1706,6 +1771,7 @@ fn profile_v2_for_subcommand<'a>(
     match subcommand {
         Subcommand::Exec(_)
         | Subcommand::Review(_)
+        | Subcommand::Agents(_)
         | Subcommand::Resume(_)
         | Subcommand::Archive(_)
         | Subcommand::Delete(_)
@@ -2229,6 +2295,7 @@ fn unsupported_subcommand_name_for_strict_config(
 ) -> Option<&'static str> {
     match subcommand {
         None
+        | Some(Subcommand::Agents(_))
         | Some(Subcommand::Exec(_))
         | Some(Subcommand::Review(_))
         | Some(Subcommand::McpServer(_))
@@ -2643,6 +2710,22 @@ mod tests {
     use codex_protocol::ThreadId;
     use codex_tui::TokenUsage;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn agents_subcommand_parses() {
+        let cli = parse_multitool_cli([OsString::from("codex"), OsString::from("agents")])
+            .expect("agents command should parse");
+
+        assert!(matches!(cli.subcommand, Some(Subcommand::Agents(_))));
+    }
+
+    #[test]
+    fn codex_agents_alias_dispatches_to_agents_subcommand() {
+        let cli = parse_multitool_cli([OsString::from("/usr/local/bin/codex-agents")])
+            .expect("agents alias should parse");
+
+        assert!(matches!(cli.subcommand, Some(Subcommand::Agents(_))));
+    }
 
     #[tokio::test]
     async fn updater_http_client_factory_honors_respect_system_proxy() {

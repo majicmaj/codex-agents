@@ -57,6 +57,7 @@ fn set_selected_session(state: &mut PickerState, thread_id: ThreadId) {
         updated_at: None,
         cwd: None,
         git_branch: None,
+        dashboard_status: None,
     }];
     state.apply_filter();
 }

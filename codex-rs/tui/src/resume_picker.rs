@@ -4,12 +4,21 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::app_event::AppEvent;
+use crate::app_event::ConnectorsSnapshot;
+use crate::app_event_sender::AppEventSender;
 use crate::app_server_session::AppServerSession;
 use crate::app_server_session::HISTORY_ITEM_PAGE_LIMIT;
 use crate::app_server_session::HISTORY_ITEM_SCAN_LIMIT;
+use crate::bottom_pane::ChatComposer;
+use crate::bottom_pane::InputResult;
 use crate::clipboard_paste::normalize_pasted_search_query;
 use crate::color::blend;
 use crate::color::is_light;
+use crate::dashboard::DashboardGroupMode;
+use crate::dashboard::DashboardHistory;
+use crate::dashboard::DashboardStatus;
+use crate::file_search::FileSearchManager;
 use crate::git_action_directives::parse_assistant_markdown;
 use crate::inline_visualization::InlineVisualizationContext;
 use crate::key_hint::KeyBindingListExt;
@@ -38,9 +47,12 @@ use crate::wrapping::RtOptions;
 use crate::wrapping::adaptive_wrap_lines;
 use chrono::DateTime;
 use chrono::Utc;
+use codex_app_server_client::AppServerEvent;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::SkillMetadata;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
@@ -52,6 +64,7 @@ use codex_app_server_protocol::ThreadSortKey;
 use codex_app_server_protocol::ThreadUnarchiveParams;
 use codex_app_server_protocol::ThreadUnarchiveResponse;
 use codex_config::types::SessionPickerViewMode;
+use codex_plugin::PluginCapabilitySummary;
 use codex_protocol::ThreadId;
 use codex_utils_path as path_utils;
 use color_eyre::eyre::Result;
@@ -79,9 +92,11 @@ use tracing::warn;
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
+mod agents_dashboard;
 mod archive;
 mod page_loading;
 
+use agents_dashboard::DashboardComposer;
 use page_loading::PageLoadMode;
 use page_loading::PaginationState;
 
@@ -92,13 +107,14 @@ const SESSION_META_DATE_WIDTH: usize = 12;
 const SESSION_META_FIELD_GAP_WIDTH: usize = 2;
 const SESSION_META_MIN_CWD_WIDTH: usize = 30;
 const SESSION_META_MAX_CWD_WIDTH: usize = 72;
+const DASHBOARD_STATUS_COLUMN_WIDTH: usize = 14;
 const SESSION_META_BRANCH_ICON: &str = "";
 const SESSION_META_CWD_ICON: &str = "⌁";
 const FOOTER_COMPACT_BREAKPOINT: u16 = 120;
 const FOOTER_HINT_LEFT_PADDING: usize = 1;
 const FOOTER_HINT_GAP: usize = 3;
-const PICKER_CHROME_HEIGHT: u16 = 8;
-const PICKER_LIST_HORIZONTAL_INSET: u16 = 4;
+const PICKER_LIST_HORIZONTAL_MARGIN: u16 = 2;
+const DASHBOARD_LIST_HORIZONTAL_MARGIN: u16 = 1;
 
 #[derive(Debug, Clone)]
 pub struct SessionTarget {
@@ -118,9 +134,31 @@ impl SessionTarget {
 #[derive(Debug, Clone)]
 pub enum SessionSelection {
     StartFresh,
+    ReconnectDashboard(DashboardResumeState),
+    StartFreshIn {
+        cwd: PathBuf,
+        user_message: crate::chatwidget::UserMessage,
+    },
     Resume(SessionTarget),
     Fork(SessionTarget),
     Exit,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DashboardResumeState {
+    draft: String,
+    group_mode: DashboardGroupMode,
+    selected_thread_id: Option<ThreadId>,
+    selected_cwd: Option<PathBuf>,
+}
+
+impl DashboardResumeState {
+    pub(crate) fn with_draft(draft: Option<String>) -> Self {
+        Self {
+            draft: draft.unwrap_or_default(),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -132,7 +170,15 @@ pub enum SessionPickerAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionPickerLaunchContext {
     Startup,
+    AgentsDashboard,
     ExistingSession { current_thread_id: Option<ThreadId> },
+}
+
+struct SessionPickerLaunch {
+    show_all: bool,
+    include_non_interactive: bool,
+    context: SessionPickerLaunchContext,
+    dashboard_resume_state: Option<DashboardResumeState>,
 }
 
 impl SessionPickerAction {
@@ -185,6 +231,9 @@ enum PickerLoadRequest {
     },
     Unarchive {
         thread_id: ThreadId,
+    },
+    DashboardComposerInventory {
+        cwd: PathBuf,
     },
 }
 
@@ -306,6 +355,13 @@ enum BackgroundEvent {
         thread_id: ThreadId,
         result: std::io::Result<SessionTarget>,
     },
+    AppServer(AppServerEvent),
+    DashboardComposerInventory {
+        cwd: PathBuf,
+        skills: Option<Vec<SkillMetadata>>,
+        plugins: Option<Vec<PluginCapabilitySummary>>,
+        connectors: Option<ConnectorsSnapshot>,
+    },
 }
 
 #[derive(Clone)]
@@ -315,6 +371,7 @@ enum PageCursor {
 
 struct PickerPage {
     rows: Vec<Row>,
+    dashboard_system_errors: HashSet<ThreadId>,
     next_cursor: Option<PageCursor>,
     num_scanned_files: usize,
     reached_scan_cap: bool,
@@ -338,6 +395,11 @@ struct SessionPickerRunOptions {
     list_keymap: ListKeymap,
     initial_page_mode: PageLoadMode,
     chord_keymap: Arc<RuntimeChordKeymap>,
+    dashboard_keymap: Option<RuntimeKeymap>,
+    dashboard_fallback_cwd: Option<PathBuf>,
+    dashboard_disable_paste_burst: bool,
+    dashboard_history: Option<DashboardHistory>,
+    dashboard_resume_state: Option<DashboardResumeState>,
 }
 
 /// Interactive session picker that lists app-server threads with simple search,
@@ -367,11 +429,36 @@ pub async fn run_resume_picker_with_app_server(
     run_resume_picker_with_launch_context(
         tui,
         config,
-        show_all,
-        include_non_interactive,
         app_server,
         archive_request_handle,
-        SessionPickerLaunchContext::Startup,
+        SessionPickerLaunch {
+            show_all,
+            include_non_interactive,
+            context: SessionPickerLaunchContext::Startup,
+            dashboard_resume_state: None,
+        },
+    )
+    .await
+}
+
+pub(crate) async fn run_agents_dashboard_with_app_server(
+    tui: &mut Tui,
+    config: &Config,
+    app_server: AppServerSession,
+    resume_state: DashboardResumeState,
+) -> Result<SessionSelection> {
+    let archive_request_handle = app_server.request_handle();
+    run_resume_picker_with_launch_context(
+        tui,
+        config,
+        app_server,
+        archive_request_handle,
+        SessionPickerLaunch {
+            show_all: true,
+            include_non_interactive: false,
+            context: SessionPickerLaunchContext::AgentsDashboard,
+            dashboard_resume_state: Some(resume_state),
+        },
     )
     .await
 }
@@ -388,11 +475,14 @@ pub async fn run_resume_picker_from_existing_session_with_app_server(
     run_resume_picker_with_launch_context(
         tui,
         config,
-        show_all,
-        include_non_interactive,
         app_server,
         archive_request_handle,
-        SessionPickerLaunchContext::ExistingSession { current_thread_id },
+        SessionPickerLaunch {
+            show_all,
+            include_non_interactive,
+            context: SessionPickerLaunchContext::ExistingSession { current_thread_id },
+            dashboard_resume_state: None,
+        },
     )
     .await
 }
@@ -400,12 +490,16 @@ pub async fn run_resume_picker_from_existing_session_with_app_server(
 async fn run_resume_picker_with_launch_context(
     tui: &mut Tui,
     config: &Config,
-    show_all: bool,
-    include_non_interactive: bool,
     app_server: AppServerSession,
     archive_request_handle: AppServerRequestHandle,
-    launch_context: SessionPickerLaunchContext,
+    launch: SessionPickerLaunch,
 ) -> Result<SessionSelection> {
+    let SessionPickerLaunch {
+        show_all,
+        include_non_interactive,
+        context: launch_context,
+        dashboard_resume_state,
+    } = launch;
     let (bg_tx, bg_rx) = mpsc::unbounded_channel();
     let uses_remote_workspace = app_server.uses_remote_workspace();
     let cwd_filter = picker_cwd_filter(
@@ -417,6 +511,8 @@ async fn run_resume_picker_with_launch_context(
     let local_filter_cwd = local_picker_cwd_filter(&cwd_filter, uses_remote_workspace);
     let provider_filter = picker_provider_filter(config, uses_remote_workspace);
     let runtime_keymap = picker_runtime_keymap(config)?;
+    let dashboard_keymap = matches!(launch_context, SessionPickerLaunchContext::AgentsDashboard)
+        .then(|| runtime_keymap.clone());
     let options = SessionPickerRunOptions {
         show_all,
         filter_cwd: cwd_filter,
@@ -436,6 +532,15 @@ async fn run_resume_picker_with_launch_context(
             PageLoadMode::StateDbOnly
         },
         chord_keymap: runtime_keymap.chords,
+        dashboard_keymap,
+        dashboard_fallback_cwd: matches!(
+            launch_context,
+            SessionPickerLaunchContext::AgentsDashboard
+        )
+        .then(|| config.cwd.to_path_buf()),
+        dashboard_disable_paste_burst: config.disable_paste_burst,
+        dashboard_history: Some(DashboardHistory::new(config)),
+        dashboard_resume_state,
     };
     run_session_picker_with_loader(
         tui,
@@ -446,6 +551,7 @@ async fn run_resume_picker_with_launch_context(
             include_non_interactive,
             raw_reasoning_visibility(config),
             (!uses_remote_workspace).then(|| config.codex_home.to_path_buf()),
+            matches!(launch_context, SessionPickerLaunchContext::AgentsDashboard),
             bg_tx,
         ),
         bg_rx,
@@ -490,6 +596,11 @@ pub async fn run_fork_picker_with_app_server(
             PageLoadMode::StateDbOnly
         },
         chord_keymap: runtime_keymap.chords,
+        dashboard_keymap: None,
+        dashboard_fallback_cwd: None,
+        dashboard_disable_paste_burst: false,
+        dashboard_history: None,
+        dashboard_resume_state: None,
     };
     run_session_picker_with_loader(
         tui,
@@ -500,6 +611,7 @@ pub async fn run_fork_picker_with_app_server(
             /*include_non_interactive*/ false,
             raw_reasoning_visibility(config),
             (!uses_remote_workspace).then(|| config.codex_home.to_path_buf()),
+            /*show_dashboard_status*/ false,
             bg_tx,
         ),
         bg_rx,
@@ -514,6 +626,8 @@ async fn run_session_picker_with_loader(
     bg_rx: mpsc::UnboundedReceiver<BackgroundEvent>,
 ) -> Result<SessionSelection> {
     let alt = AltScreenGuard::enter(tui);
+    let (dashboard_app_event_tx, dashboard_app_event_rx) = mpsc::unbounded_channel();
+    let dashboard_app_event_sender = AppEventSender::new(dashboard_app_event_tx.clone());
     let mut state = PickerState::new(
         alt.tui.frame_requester(),
         picker_loader,
@@ -530,6 +644,36 @@ async fn run_session_picker_with_loader(
     state.chord_keymap = options.chord_keymap;
     state.launch_context = options.launch_context;
     state.initial_page_mode = options.initial_page_mode;
+    let mut dashboard_app_events = UnboundedReceiverStream::new(dashboard_app_event_rx).fuse();
+    let mut dashboard_file_search = options
+        .dashboard_fallback_cwd
+        .as_ref()
+        .map(|cwd| FileSearchManager::new(cwd.clone(), dashboard_app_event_sender.clone()));
+    if let (Some(cwd), Some(keymap)) = (
+        options.dashboard_fallback_cwd.as_deref(),
+        options.dashboard_keymap.as_ref(),
+    ) {
+        state.initialize_dashboard_composer(
+            alt.tui.enhanced_keys_supported(),
+            options.dashboard_disable_paste_burst,
+            dashboard_app_event_sender.clone(),
+            cwd,
+            keymap,
+        );
+        if let Some(resume_state) = options.dashboard_resume_state.as_ref()
+            && let Some(dashboard) = state.dashboard_composer.as_mut()
+        {
+            dashboard.composer.insert_str(&resume_state.draft);
+            state.dashboard_group_mode = resume_state.group_mode;
+            state.dashboard_restore_thread_id = resume_state.selected_thread_id;
+            state.dashboard_restore_cwd = resume_state.selected_cwd.clone();
+        }
+        if let Some(history) = options.dashboard_history.as_ref()
+            && let Some(dashboard) = state.dashboard_composer.as_mut()
+        {
+            history.initialize(&mut dashboard.composer).await;
+        }
+    }
     state.start_initial_load();
     state.request_frame();
 
@@ -565,9 +709,17 @@ async fn run_session_picker_with_loader(
                         state.handle_paste(pasted);
                     }
                     TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => {
-                        let list_width = list_viewport_width(screen_size.width);
-                        let list_height =
-                            usize::from(screen_size.height.saturating_sub(PICKER_CHROME_HEIGHT));
+                        let list_width = list_viewport_width(screen_size.width, &state);
+                        let list_height = usize::from(
+                            screen_size
+                                .height
+                                .saturating_sub(4)
+                                .saturating_sub(picker_bottom_height(
+                                    &state,
+                                    screen_size.width,
+                                    screen_size.height,
+                                )),
+                        );
                         state.update_viewport(list_height, list_width);
                         state.ensure_minimum_rows_for_view(list_height);
                         draw_picker(alt.tui, &state, screen_size)?;
@@ -580,6 +732,35 @@ async fn run_session_picker_with_loader(
             Some(event) = background_events.next() => {
                 if let Some(selection) = state.handle_background_event(event).await? {
                     return Ok(selection);
+                }
+            }
+            Some(event) = dashboard_app_events.next(), if state.dashboard_composer.is_some() => {
+                match event {
+                    AppEvent::StartFileSearch(query) => {
+                        if let Some(file_search) = dashboard_file_search.as_mut() {
+                            let cwd = state.dashboard_project_cwd();
+                            file_search.update_search_dir(cwd);
+                            file_search.on_user_query(query);
+                        }
+                    }
+                    AppEvent::FileSearchResult { query, matches } => {
+                        if let Some(composer) = state.dashboard_composer.as_mut() {
+                            composer.composer.on_file_search_result(query, matches);
+                            state.request_frame();
+                        }
+                    }
+                    event => {
+                        if let (Some(history), Some(composer)) = (
+                            options.dashboard_history.as_ref(),
+                            state.dashboard_composer.as_mut(),
+                        ) && history.handle_event(
+                            event,
+                            &dashboard_app_event_sender,
+                            &mut composer.composer,
+                        ) {
+                            state.request_frame();
+                        }
+                    }
                 }
             }
             else => break,
@@ -643,14 +824,20 @@ fn spawn_app_server_page_loader(
     include_non_interactive: bool,
     raw_reasoning_visibility: RawReasoningVisibility,
     codex_home: Option<PathBuf>,
+    show_dashboard_status: bool,
     bg_tx: mpsc::UnboundedSender<BackgroundEvent>,
 ) -> PickerLoader {
     let (request_tx, mut request_rx) = mpsc::unbounded_channel::<PickerLoadRequest>();
 
     tokio::spawn(async move {
         let mut app_server = app_server;
-        while let Some(request) = request_rx.recv().await {
-            match request {
+        loop {
+            tokio::select! {
+                request = request_rx.recv() => {
+                    let Some(request) = request else {
+                        break;
+                    };
+                    match request {
                 PickerLoadRequest::Page(request) => {
                     let cursor = request.cursor.map(|PageCursor::AppServer(cursor)| cursor);
                     let params = thread_list_params(
@@ -662,7 +849,8 @@ fn spawn_app_server_page_loader(
                         include_non_interactive,
                         matches!(request.mode, PageLoadMode::StateDbOnly),
                     );
-                    let page = load_app_server_page(&mut app_server, params).await;
+                    let page =
+                        load_app_server_page(&mut app_server, params, show_dashboard_status).await;
                     let _ = bg_tx.send(BackgroundEvent::Page {
                         request_token: request.request_token,
                         search_token: request.search_token,
@@ -729,6 +917,47 @@ fn spawn_app_server_page_loader(
                         .map_err(std::io::Error::other);
                     let _ = bg_tx.send(BackgroundEvent::Unarchive { thread_id, result });
                 }
+                PickerLoadRequest::DashboardComposerInventory { cwd } => {
+                    let request_handle = app_server.request_handle();
+                    let (skills, plugins, connectors) = tokio::join!(
+                        crate::app::background_requests::fetch_skills_list(
+                            request_handle.clone(),
+                            cwd.clone(),
+                        ),
+                        crate::app::plugin_mentions::fetch_plugin_mentions(
+                            request_handle.clone(),
+                            cwd.clone(),
+                        ),
+                        crate::app::background_requests::fetch_connectors_list(
+                            request_handle,
+                            /*force_refetch*/ false,
+                            /*thread_id*/ None,
+                        ),
+                    );
+                    let skills = skills.ok().and_then(|response| {
+                        response
+                            .data
+                            .into_iter()
+                            .find(|entry| entry.cwd == cwd)
+                            .map(|entry| {
+                                entry.skills.into_iter().filter(|skill| skill.enabled).collect()
+                            })
+                    });
+                    let _ = bg_tx.send(BackgroundEvent::DashboardComposerInventory {
+                        cwd,
+                        skills,
+                        plugins: plugins.ok(),
+                        connectors: connectors.ok(),
+                    });
+                }
+                    }
+                }
+                event = app_server.next_event(), if show_dashboard_status => {
+                    let Some(event) = event else {
+                        break;
+                    };
+                    let _ = bg_tx.send(BackgroundEvent::AppServer(event));
+                }
             }
         }
         if let Err(err) = app_server.shutdown().await {
@@ -778,6 +1007,7 @@ struct PickerState {
     seen_rows: HashSet<SeenRowKey>,
     selected: usize,
     scroll_top: usize,
+    dashboard_scroll_offset: usize,
     pending_page_down_target: Option<usize>,
     frozen_footer_percent: Option<u8>,
     query: String,
@@ -795,6 +1025,7 @@ struct PickerState {
     toolbar_focus: ToolbarControl,
     density: SessionListDensity,
     launch_context: SessionPickerLaunchContext,
+    dashboard_group_mode: DashboardGroupMode,
     view_persistence: Option<SessionPickerViewPersistence>,
     action: SessionPickerAction,
     sort_key: ThreadSortKey,
@@ -812,6 +1043,14 @@ struct PickerState {
     initial_page_mode: PageLoadMode,
     chord_keymap: Arc<RuntimeChordKeymap>,
     chord_matcher: crate::keymap::KeyChordMatcher,
+    dashboard_composer: Option<DashboardComposer>,
+    dashboard_search_active: bool,
+    dashboard_fallback_cwd: Option<PathBuf>,
+    pending_dashboard_submission: Option<crate::chatwidget::UserMessage>,
+    dashboard_system_errors: HashSet<ThreadId>,
+    dashboard_inventory_cwd: Option<PathBuf>,
+    dashboard_restore_thread_id: Option<ThreadId>,
+    dashboard_restore_cwd: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -853,6 +1092,7 @@ enum LoadTrigger {
 async fn load_app_server_page(
     app_server: &mut AppServerSession,
     params: ThreadListParams,
+    show_dashboard_status: bool,
 ) -> std::io::Result<PickerPage> {
     let response = app_server
         .thread_list(params)
@@ -860,16 +1100,39 @@ async fn load_app_server_page(
         .map_err(std::io::Error::other)?;
     let num_scanned_files = response.data.len();
 
+    let dashboard_system_errors = response
+        .data
+        .iter()
+        .filter(|thread| {
+            show_dashboard_status
+                && dashboard_thread_is_root(thread)
+                && matches!(
+                    thread.status,
+                    codex_app_server_protocol::ThreadStatus::SystemError
+                )
+        })
+        .filter_map(|thread| ThreadId::from_string(&thread.id).ok())
+        .collect();
     Ok(PickerPage {
         rows: response
             .data
             .into_iter()
-            .filter_map(row_from_app_server_thread)
+            .filter(|thread| thread_visible_in_picker(thread, show_dashboard_status))
+            .filter_map(|thread| row_from_app_server_thread(thread, show_dashboard_status))
             .collect(),
+        dashboard_system_errors,
         next_cursor: response.next_cursor.map(PageCursor::AppServer),
         num_scanned_files,
         reached_scan_cap: false,
     })
+}
+
+fn dashboard_thread_is_root(thread: &Thread) -> bool {
+    thread.parent_thread_id.is_none()
+}
+
+fn thread_visible_in_picker(thread: &Thread, show_dashboard_status: bool) -> bool {
+    !show_dashboard_status || dashboard_thread_is_root(thread)
 }
 
 pub(crate) async fn load_transcript_preview(
@@ -1034,6 +1297,7 @@ struct Row {
     updated_at: Option<DateTime<Utc>>,
     cwd: Option<PathBuf>,
     git_branch: Option<String>,
+    dashboard_status: Option<DashboardStatus>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1043,6 +1307,12 @@ enum SeenRowKey {
 }
 
 impl Row {
+    fn recency_timestamp(&self) -> i64 {
+        self.updated_at
+            .or(self.created_at)
+            .map_or(0, |time| time.timestamp())
+    }
+
     fn seen_key(&self) -> Option<SeenRowKey> {
         if let Some(path) = self.path.clone() {
             return Some(SeenRowKey::Path(path));
@@ -1105,6 +1375,7 @@ impl PickerState {
             seen_rows: HashSet::new(),
             selected: 0,
             scroll_top: 0,
+            dashboard_scroll_offset: 0,
             pending_page_down_target: None,
             frozen_footer_percent: None,
             query: String::new(),
@@ -1122,6 +1393,7 @@ impl PickerState {
             toolbar_focus: ToolbarControl::Filter,
             density: SessionListDensity::Comfortable,
             launch_context: SessionPickerLaunchContext::Startup,
+            dashboard_group_mode: DashboardGroupMode::Project,
             view_persistence: None,
             action,
             sort_key: ThreadSortKey::UpdatedAt,
@@ -1139,12 +1411,26 @@ impl PickerState {
             initial_page_mode: PageLoadMode::StoreDefault,
             chord_keymap: Arc::default(),
             chord_matcher: crate::keymap::KeyChordMatcher::default(),
+            dashboard_composer: None,
+            dashboard_search_active: false,
+            dashboard_fallback_cwd: None,
+            pending_dashboard_submission: None,
+            dashboard_system_errors: HashSet::new(),
+            dashboard_inventory_cwd: None,
+            dashboard_restore_thread_id: None,
+            dashboard_restore_cwd: None,
         }
     }
 
     fn route_key_chord(&mut self, key: KeyEvent) -> Option<KeyEvent> {
         let context = if self.overlay.is_some() {
             crate::keymap::KeymapContext::Pager
+        } else if !self.dashboard_search_active
+            && self.dashboard_composer.as_ref().is_some_and(|dashboard| {
+                !dashboard.composer.is_empty() || dashboard.composer.popup_active()
+            })
+        {
+            crate::keymap::KeymapContext::Composer
         } else {
             crate::keymap::KeymapContext::List
         };
@@ -1275,13 +1561,22 @@ impl PickerState {
         }
     }
 
-    async fn handle_key(&mut self, key: KeyEvent) -> Result<Option<SessionSelection>> {
+    async fn handle_key(&mut self, mut key: KeyEvent) -> Result<Option<SessionSelection>> {
         self.inline_error = None;
         if self.is_transcript_loading() {
             return Ok(self.handle_transcript_loading_key(key));
         }
         if !self.list_keymap.page_down.is_pressed(key) {
             self.pending_page_down_target = None;
+        }
+        if self.is_agents_dashboard()
+            && self.dashboard_composer.as_ref().is_some_and(|dashboard| {
+                dashboard.composer.is_empty()
+                    && !dashboard.composer.popup_active()
+                    && self.list_keymap.move_right.is_pressed(key)
+            })
+        {
+            key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         }
         // The session picker is always searchable, so plain text belongs to
         // the query first. Modified list bindings still route through the
@@ -1294,6 +1589,52 @@ impl PickerState {
                 ..
             } if modifiers.contains(KeyModifiers::CONTROL) => {
                 return Ok(Some(SessionSelection::Exit));
+            }
+            KeyEvent {
+                code: KeyCode::Char('f'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) && self.is_agents_dashboard() => {
+                self.dashboard_search_active = !self.dashboard_search_active;
+                if !self.dashboard_search_active {
+                    self.clear_query_preserving_selection();
+                }
+                self.request_frame();
+            }
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if self.dashboard_search_active => {
+                self.dashboard_search_active = false;
+                self.clear_query_preserving_selection();
+            }
+            KeyEvent {
+                code: KeyCode::Char('g'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) && self.is_agents_dashboard() => {
+                self.toggle_dashboard_group_mode();
+            }
+            KeyEvent {
+                code: KeyCode::Up,
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) && self.is_agents_dashboard() => {
+                self.move_dashboard_selection(/*down*/ false);
+            }
+            KeyEvent {
+                code: KeyCode::Down,
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) && self.is_agents_dashboard() => {
+                self.move_dashboard_selection(/*down*/ true);
+            }
+            _ if self.is_agents_dashboard()
+                && !self.dashboard_search_active
+                && self.handle_dashboard_composer_key(key) =>
+            {
+                if let Some(selection) = self.take_dashboard_submission() {
+                    return Ok(Some(selection));
+                }
             }
             _ if self.list_keymap.cancel.is_pressed(key) => {
                 if self.query.is_empty() {
@@ -1346,6 +1687,9 @@ impl PickerState {
             _ if self.list_keymap.accept.is_pressed(key)
                 && !matches!(self.archive_state, archive::ArchiveState::Idle) => {}
             _ if self.list_keymap.accept.is_pressed(key) => {
+                if self.handle_dashboard_command() {
+                    return Ok(None);
+                }
                 if let Some(row) = self.filtered_rows.get(self.selected) {
                     let path = row.path.clone();
                     let thread_id = match row.thread_id {
@@ -1369,6 +1713,9 @@ impl PickerState {
                         Some(path) => {
                             format!("Failed to read session metadata from {}", path.display())
                         }
+                        None if self.is_agents_dashboard() => String::from(
+                            "Type a prompt below to start an agent in the selected project",
+                        ),
                         None => {
                             String::from("Failed to read session metadata from selected session")
                         }
@@ -1482,6 +1829,13 @@ impl PickerState {
         if self.is_transcript_loading() {
             return;
         }
+        if let Some(dashboard_composer) = self.dashboard_composer.as_mut()
+            && !self.dashboard_search_active
+        {
+            dashboard_composer.composer.handle_paste(pasted);
+            self.request_frame();
+            return;
+        }
         let Some(pasted) = normalize_pasted_search_query(&pasted) else {
             return;
         };
@@ -1572,6 +1926,7 @@ impl PickerState {
                 }
                 let page = page.map_err(color_eyre::Report::from)?;
                 self.ingest_page(page);
+                self.load_dashboard_composer_inventory();
                 self.complete_pending_page_down();
                 let completed_token = pending.search_token.or(search_token);
                 self.continue_search_if_token_matches(completed_token);
@@ -1618,8 +1973,151 @@ impl PickerState {
             BackgroundEvent::Unarchive { thread_id, result } => {
                 return Ok(self.handle_unarchive_result(thread_id, result));
             }
+            BackgroundEvent::AppServer(event) => {
+                if self.handle_app_server_event(event) {
+                    return Ok(Some(SessionSelection::ReconnectDashboard(
+                        self.dashboard_resume_state(),
+                    )));
+                }
+            }
+            BackgroundEvent::DashboardComposerInventory {
+                cwd,
+                skills,
+                plugins,
+                connectors,
+            } => {
+                if paths_match(&cwd, &self.dashboard_project_cwd())
+                    && let Some(dashboard) = self.dashboard_composer.as_mut()
+                {
+                    dashboard.composer.set_skill_mentions(skills);
+                    dashboard.composer.set_plugin_mentions(plugins);
+                    dashboard.composer.set_connector_mentions(connectors);
+                    self.request_frame();
+                }
+            }
         }
         Ok(None)
+    }
+
+    fn handle_app_server_event(&mut self, event: AppServerEvent) -> bool {
+        match event {
+            AppServerEvent::ServerNotification(notification) => match *notification {
+                ServerNotification::ThreadStatusChanged(notification) => {
+                    if let Ok(thread_id) = ThreadId::from_string(&notification.thread_id) {
+                        if matches!(
+                            notification.status,
+                            codex_app_server_protocol::ThreadStatus::SystemError
+                        ) {
+                            self.dashboard_system_errors.insert(thread_id);
+                        } else {
+                            self.dashboard_system_errors.remove(&thread_id);
+                        }
+                    }
+                    if let Ok(thread_id) = ThreadId::from_string(&notification.thread_id) {
+                        self.transcript_previews.remove(&thread_id);
+                    }
+                    self.update_dashboard_row(&notification.thread_id, |row| {
+                        row.dashboard_status = Some(crate::dashboard::status(&notification.status));
+                    });
+                }
+                ServerNotification::ThreadNameUpdated(notification) => {
+                    self.update_dashboard_row(&notification.thread_id, |row| {
+                        row.thread_name = notification.thread_name;
+                    });
+                }
+                ServerNotification::ThreadArchived(notification) => {
+                    self.remove_dashboard_row(&notification.thread_id);
+                }
+                ServerNotification::ThreadUnarchived(_) => self.start_initial_load(),
+                ServerNotification::ThreadDeleted(notification) => {
+                    self.remove_dashboard_row(&notification.thread_id);
+                }
+                ServerNotification::ThreadStarted(notification) => {
+                    if notification.thread.parent_thread_id.is_some() {
+                        return false;
+                    }
+                    if matches!(
+                        notification.thread.status,
+                        codex_app_server_protocol::ThreadStatus::SystemError
+                    ) && let Ok(thread_id) = ThreadId::from_string(&notification.thread.id)
+                    {
+                        self.dashboard_system_errors.insert(thread_id);
+                    }
+                    if let Some(row) = row_from_app_server_thread(notification.thread, true) {
+                        if row
+                            .seen_key()
+                            .is_some_and(|seen_key| !self.seen_rows.insert(seen_key))
+                        {
+                            return false;
+                        }
+                        self.all_rows.push(row);
+                        self.apply_filter();
+                    }
+                }
+                _ => {}
+            },
+            AppServerEvent::Lagged { .. } => self.start_initial_load(),
+            AppServerEvent::Disconnected { message } => {
+                self.inline_error = Some(format!("Dashboard disconnected: {message}"));
+                self.request_frame();
+                return self.is_agents_dashboard();
+            }
+            AppServerEvent::ServerRequest(_) => {}
+        }
+        false
+    }
+
+    fn update_dashboard_row(&mut self, thread_id: &str, update: impl FnOnce(&mut Row)) {
+        let selected_thread_id = self
+            .filtered_rows
+            .get(self.selected)
+            .and_then(|row| row.thread_id);
+        let Ok(thread_id) = ThreadId::from_string(thread_id) else {
+            return;
+        };
+        let Some(row) = self
+            .all_rows
+            .iter_mut()
+            .find(|row| row.thread_id == Some(thread_id))
+        else {
+            return;
+        };
+        update(row);
+        row.updated_at = Some(Utc::now());
+        self.apply_filter();
+        self.restore_dashboard_selection(selected_thread_id);
+    }
+
+    fn remove_dashboard_row(&mut self, thread_id: &str) {
+        let selected_thread_id = self
+            .filtered_rows
+            .get(self.selected)
+            .and_then(|row| row.thread_id)
+            .filter(|selected| selected.to_string() != thread_id);
+        let Ok(thread_id) = ThreadId::from_string(thread_id) else {
+            return;
+        };
+        self.all_rows.retain(|row| row.thread_id != Some(thread_id));
+        self.seen_rows.remove(&SeenRowKey::Thread(thread_id));
+        self.dashboard_system_errors.remove(&thread_id);
+        self.transcript_previews.remove(&thread_id);
+        self.apply_filter();
+        self.restore_dashboard_selection(selected_thread_id);
+    }
+
+    fn restore_dashboard_selection(&mut self, thread_id: Option<ThreadId>) {
+        if let Some(thread_id) = thread_id
+            && let Some(index) = self
+                .filtered_rows
+                .iter()
+                .position(|row| row.thread_id == Some(thread_id))
+        {
+            self.selected = index;
+        }
+        self.selected = self
+            .selected
+            .min(self.filtered_rows.len().saturating_sub(1));
+        self.ensure_selected_visible();
     }
 
     fn reset_pagination(&mut self) {
@@ -1630,12 +2128,14 @@ impl PickerState {
     fn ingest_page(&mut self, page: PickerPage) {
         let PickerPage {
             rows,
+            dashboard_system_errors,
             next_cursor,
             num_scanned_files,
             reached_scan_cap,
         } = page;
         self.pagination
             .complete_page(next_cursor, num_scanned_files, reached_scan_cap);
+        self.dashboard_system_errors.extend(dashboard_system_errors);
 
         for row in rows {
             if let Some(seen_key) = row.seen_key() {
@@ -1672,6 +2172,10 @@ impl PickerState {
     }
 
     fn apply_filter(&mut self) {
+        let selected_key = self
+            .filtered_rows
+            .get(self.selected)
+            .and_then(Row::seen_key);
         let base_iter = self
             .all_rows
             .iter()
@@ -1681,6 +2185,54 @@ impl PickerState {
         } else {
             let q = self.query.to_lowercase();
             self.filtered_rows = base_iter.filter(|r| r.matches_query(&q)).cloned().collect();
+        }
+        if self.is_agents_dashboard()
+            && let Some(cwd) = self.dashboard_fallback_cwd.as_ref()
+            && self.query.is_empty()
+            && !self.filtered_rows.iter().any(|row| {
+                row.cwd
+                    .as_ref()
+                    .is_some_and(|row_cwd| paths_match(row_cwd, cwd))
+            })
+        {
+            self.filtered_rows.push(Row {
+                path: None,
+                preview: String::from("Start a new agent"),
+                thread_id: None,
+                thread_name: None,
+                created_at: None,
+                updated_at: None,
+                cwd: Some(cwd.clone()),
+                git_branch: None,
+                dashboard_status: None,
+            });
+        }
+        self.sort_dashboard_rows();
+        if let Some(thread_id) = self.dashboard_restore_thread_id
+            && let Some(index) = self
+                .filtered_rows
+                .iter()
+                .position(|row| row.thread_id == Some(thread_id))
+        {
+            self.selected = index;
+            self.dashboard_restore_thread_id = None;
+            self.dashboard_restore_cwd = None;
+        } else if let Some(cwd) = self.dashboard_restore_cwd.as_ref()
+            && let Some(index) = self.filtered_rows.iter().position(|row| {
+                row.cwd
+                    .as_ref()
+                    .is_some_and(|row_cwd| paths_match(row_cwd, cwd))
+            })
+        {
+            self.selected = index;
+        }
+        if let Some(selected_key) = selected_key
+            && let Some(index) = self
+                .filtered_rows
+                .iter()
+                .position(|row| row.seen_key().as_ref() == Some(&selected_key))
+        {
+            self.selected = index;
         }
         if self.selected >= self.filtered_rows.len() {
             self.selected = self.filtered_rows.len().saturating_sub(1);
@@ -1779,9 +2331,38 @@ impl PickerState {
     fn ensure_selected_visible(&mut self) {
         if self.filtered_rows.is_empty() {
             self.scroll_top = 0;
+            self.dashboard_scroll_offset = 0;
             return;
         }
         let viewport_rows = self.view_rows.unwrap_or(usize::MAX).max(1);
+        if self.is_agents_dashboard() {
+            let selected_end = self.rendered_height_between(/*start*/ 0, self.selected);
+            let selected_start = if self.selected == 0 {
+                0
+            } else {
+                self.rendered_height_between(/*start*/ 0, self.selected - 1)
+                    + self.row_separator_height()
+            };
+            let has_more_after_selection = self.pagination.next_cursor.is_some()
+                || self.selected + 1 < self.filtered_rows.len();
+            let available_rows = viewport_rows
+                .saturating_sub(usize::from(self.dashboard_scroll_offset > 0))
+                .saturating_sub(usize::from(has_more_after_selection))
+                .max(1);
+            if selected_start < self.dashboard_scroll_offset {
+                self.dashboard_scroll_offset = selected_start;
+            } else if selected_end > self.dashboard_scroll_offset.saturating_add(available_rows) {
+                self.dashboard_scroll_offset = selected_end.saturating_sub(available_rows);
+            }
+
+            self.scroll_top = (0..self.filtered_rows.len())
+                .find(|row_index| {
+                    self.rendered_height_between(/*start*/ 0, *row_index)
+                        > self.dashboard_scroll_offset
+                })
+                .unwrap_or_else(|| self.filtered_rows.len().saturating_sub(1));
+            return;
+        }
         if self.selected < self.scroll_top {
             self.scroll_top = self.selected;
         }
@@ -1819,6 +2400,31 @@ impl PickerState {
         self.view_rows = if rows == 0 { None } else { Some(rows) };
         self.view_width = Some(width);
         self.ensure_selected_visible();
+        self.load_visible_dashboard_previews();
+    }
+
+    fn load_visible_dashboard_previews(&mut self) {
+        if !self.is_agents_dashboard() {
+            return;
+        }
+        let visible_rows = self.view_rows.unwrap_or_default();
+        if visible_rows == 0 {
+            return;
+        }
+        let visible_end = self
+            .scroll_top
+            .saturating_add(visible_rows)
+            .min(self.filtered_rows.len());
+        let thread_ids = self.filtered_rows[self.scroll_top..visible_end]
+            .iter()
+            .filter_map(|row| row.thread_id)
+            .filter(|thread_id| !self.transcript_previews.contains_key(thread_id))
+            .collect::<Vec<_>>();
+        for thread_id in thread_ids {
+            self.transcript_previews
+                .insert(thread_id, TranscriptPreviewState::Loading);
+            (self.picker_loader)(PickerLoadRequest::Preview { thread_id });
+        }
     }
 
     fn maybe_load_more_for_scroll(&mut self) {
@@ -1999,13 +2605,18 @@ impl PickerState {
                     self.view_width.unwrap_or(u16::MAX),
                 )
                 .len()
+                    + usize::from(self.starts_dashboard_group(row_idx, start))
             })
             .sum::<usize>()
             + self.row_separator_height() * end_inclusive.saturating_sub(start)
     }
 
     fn has_more_above(&self) -> bool {
-        self.scroll_top > 0
+        if self.is_agents_dashboard() {
+            self.dashboard_scroll_offset > 0
+        } else {
+            self.scroll_top > 0
+        }
     }
 
     fn has_more_below(&self, viewport_height: usize) -> bool {
@@ -2014,6 +2625,14 @@ impl PickerState {
         }
         if self.pagination.next_cursor.is_some() {
             return true;
+        }
+        if self.is_agents_dashboard() {
+            let total_height =
+                self.rendered_height_between(/*start*/ 0, self.filtered_rows.len() - 1);
+            let available_rows = viewport_height
+                .saturating_sub(usize::from(self.has_more_above()))
+                .max(1);
+            return total_height > self.dashboard_scroll_offset.saturating_add(available_rows);
         }
         let capacity = self.available_content_rows(viewport_height);
         let mut used = 0usize;
@@ -2030,7 +2649,8 @@ impl PickerState {
                 /*is_zebra*/ false,
                 self.view_width.unwrap_or(u16::MAX),
             )
-            .len();
+            .len()
+                + usize::from(self.starts_dashboard_group(row_idx, self.scroll_top));
             let separator_height = usize::from(offset > 0) * self.row_separator_height();
             if used + separator_height + row_height > capacity {
                 return true;
@@ -2056,9 +2676,32 @@ impl PickerState {
             SessionListDensity::Dense => 0,
         }
     }
+
+    fn starts_dashboard_group(&self, row_index: usize, viewport_start: usize) -> bool {
+        if !self.is_agents_dashboard() || row_index == viewport_start {
+            return self.is_agents_dashboard();
+        }
+        self.dashboard_group_label(&self.filtered_rows[row_index - 1])
+            != self.dashboard_group_label(&self.filtered_rows[row_index])
+    }
+
+    fn dashboard_group_label(&self, row: &Row) -> String {
+        match self.dashboard_group_mode {
+            DashboardGroupMode::Project => row
+                .cwd
+                .as_ref()
+                .map(|cwd| format_directory_display(cwd, /*max_width*/ None))
+                .unwrap_or_else(|| String::from("Unknown project")),
+            DashboardGroupMode::Status => row
+                .dashboard_status
+                .map(DashboardStatus::label)
+                .unwrap_or("Done")
+                .to_string(),
+        }
+    }
 }
 
-fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
+fn row_from_app_server_thread(thread: Thread, show_dashboard_status: bool) -> Option<Row> {
     let thread_id = match ThreadId::from_string(&thread.id) {
         Ok(thread_id) => thread_id,
         Err(err) => {
@@ -2067,6 +2710,7 @@ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
         }
     };
     let preview = thread.preview.trim();
+    let dashboard_status = show_dashboard_status.then(|| crate::dashboard::status(&thread.status));
     Some(Row {
         path: thread.path,
         preview: if preview.is_empty() {
@@ -2082,6 +2726,7 @@ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
             .map(|dt| dt.with_timezone(&Utc)),
         cwd: Some(thread.cwd.to_path_buf()),
         git_branch: thread.git_info.and_then(|git_info| git_info.branch),
+        dashboard_status,
     })
 }
 
@@ -2128,63 +2773,113 @@ fn parse_timestamp_str(ts: &str) -> Option<DateTime<Utc>> {
 fn draw_picker(tui: &mut Tui, state: &PickerState, screen_size: Size) -> std::io::Result<()> {
     // Render full-screen overlay
     tui.draw(screen_size.height, |frame| {
-        let area = frame.area();
-        let [header, _header_gap, search, _search_gap, list, footer] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(area.height.saturating_sub(PICKER_CHROME_HEIGHT)),
-            Constraint::Length(4),
-        ])
-        .areas(area);
-
-        let chrome = |area: Rect| {
-            Rect::new(
-                area.x.saturating_add(1),
-                area.y,
-                area.width.saturating_sub(2),
-                area.height,
-            )
-        };
-
-        // Header
-        let header_title = if default_bg().is_some_and(is_light) {
-            state.action.title().bold().fg(best_color((0, 100, 0)))
-        } else {
-            state.action.title().bold().cyan()
-        };
-        let header_line: Line = vec![header_title].into();
-        frame.render_widget_ref(&header_line, chrome(header));
-
-        // Search line
-        let search = chrome(search);
-        frame.render_widget_ref(&search_line(state, search.width), search);
-
-        let list = Rect::new(
-            list.x.saturating_add(2),
-            list.y,
-            list_viewport_width(list.width),
-            list.height,
-        );
-        render_list(frame, list, state);
-        if state.is_transcript_loading() {
-            render_transcript_loading_overlay(frame, list);
-        }
-
-        render_picker_footer(frame, footer, state, list.height);
+        render_picker_frame(frame, state);
     })
 }
 
-fn list_viewport_width(width: u16) -> u16 {
-    width.saturating_sub(PICKER_LIST_HORIZONTAL_INSET)
+fn render_picker_frame(frame: &mut crate::custom_terminal::Frame, state: &PickerState) {
+    let area = frame.area();
+    let bottom_height = picker_bottom_height(state, area.width, area.height);
+    let [header, _header_gap, search, _search_gap, list, bottom] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(bottom_height),
+    ])
+    .areas(area);
+
+    let chrome = |area: Rect| {
+        Rect::new(
+            area.x.saturating_add(1),
+            area.y,
+            area.width.saturating_sub(2),
+            area.height,
+        )
+    };
+
+    // Header
+    let title = match state.launch_context {
+        SessionPickerLaunchContext::AgentsDashboard => "Codex Agents",
+        SessionPickerLaunchContext::Startup
+        | SessionPickerLaunchContext::ExistingSession { .. } => state.action.title(),
+    };
+    let header_title = match state.launch_context {
+        SessionPickerLaunchContext::AgentsDashboard => title.bold().magenta(),
+        SessionPickerLaunchContext::Startup
+        | SessionPickerLaunchContext::ExistingSession { .. }
+            if default_bg().is_some_and(is_light) =>
+        {
+            title.bold().fg(best_color((0, 100, 0)))
+        }
+        SessionPickerLaunchContext::Startup
+        | SessionPickerLaunchContext::ExistingSession { .. } => title.bold().cyan(),
+    };
+    let header_line: Line = vec![header_title].into();
+    frame.render_widget_ref(&header_line, chrome(header));
+
+    // Search line
+    let search = chrome(search);
+    frame.render_widget_ref(&search_line(state, search.width), search);
+
+    let list_margin = list_horizontal_margin(state);
+    let list = Rect::new(
+        list.x.saturating_add(list_margin),
+        list.y,
+        list_viewport_width(list.width, state),
+        list.height,
+    );
+    render_list(frame, list, state);
+    if state.is_transcript_loading() {
+        render_transcript_loading_overlay(frame, list);
+    }
+
+    if let Some(dashboard) = state.dashboard_composer.as_ref() {
+        let composer_area = bottom;
+        dashboard.composer.render_with_mask(
+            composer_area,
+            frame.buffer_mut(),
+            /*mask_char*/ None,
+        );
+        if !state.dashboard_search_active
+            && let Some((x, y)) = dashboard.composer.cursor_pos(composer_area)
+        {
+            frame.set_cursor_position((x, y));
+        }
+    } else {
+        render_picker_footer(frame, bottom, state, list.height);
+    }
+}
+
+fn picker_bottom_height(state: &PickerState, width: u16, height: u16) -> u16 {
+    state.dashboard_composer.as_ref().map_or(4, |dashboard| {
+        dashboard
+            .composer
+            .desired_height_with_textarea_right_reserve(width, /*textarea_right_reserve*/ 0)
+            .clamp(4, height.saturating_sub(6).max(4))
+    })
+}
+
+fn list_horizontal_margin(state: &PickerState) -> u16 {
+    if state.is_agents_dashboard() {
+        DASHBOARD_LIST_HORIZONTAL_MARGIN
+    } else {
+        PICKER_LIST_HORIZONTAL_MARGIN
+    }
+}
+
+fn list_viewport_width(width: u16, state: &PickerState) -> u16 {
+    width.saturating_sub(list_horizontal_margin(state).saturating_mul(2))
 }
 
 fn search_line(state: &PickerState, width: u16) -> Line<'_> {
     if let Some(error) = state.inline_error.as_deref() {
         return Line::from(error.red());
     }
-    let search = if state.query.is_empty() {
+    let search = if state.is_agents_dashboard() && !state.dashboard_search_active {
+        "Ctrl+F search sessions".dim()
+    } else if state.query.is_empty() {
         "Type to search".dim()
     } else {
         format!("Search: {}", state.query).into()
@@ -2218,6 +2913,17 @@ fn search_line(state: &PickerState, width: u16) -> Line<'_> {
 }
 
 fn toolbar_line(state: &PickerState, compact: bool) -> Line<'static> {
+    if state.is_agents_dashboard() {
+        return vec![
+            "Group: ".dim(),
+            toolbar_value(
+                state.dashboard_group_mode.label(),
+                /*active*/ true,
+                /*focused*/ false,
+            ),
+        ]
+        .into();
+    }
     let mut spans = Vec::new();
     let separator = if compact && matches!(state.action, SessionPickerAction::Resume) {
         " "
@@ -2482,14 +3188,16 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
     };
     let (esc_label, esc_compact_label) = if state.query.is_empty() {
         match state.launch_context {
-            SessionPickerLaunchContext::Startup => ("start new", "new"),
+            SessionPickerLaunchContext::Startup | SessionPickerLaunchContext::AgentsDashboard => {
+                ("start new", "new")
+            }
             SessionPickerLaunchContext::ExistingSession { .. } => ("exit", "exit"),
         }
     } else {
         ("clear search", "clear")
     };
     let ctrl_c_label = match state.launch_context {
-        SessionPickerLaunchContext::Startup => "quit",
+        SessionPickerLaunchContext::Startup | SessionPickerLaunchContext::AgentsDashboard => "quit",
         SessionPickerLaunchContext::ExistingSession { .. } => "exit",
     };
     let density_label = match state.density {
@@ -2525,33 +3233,41 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
             priority: 1,
         });
     }
-    first_row_hints.extend([
-        PickerFooterHint {
-            key: "ctrl+c".to_string(),
-            wide_label: ctrl_c_label.to_string(),
-            compact_label: ctrl_c_label.to_string(),
-            priority: 2,
-        },
-        PickerFooterHint {
+    if state.is_agents_dashboard() {
+        first_row_hints.push(PickerFooterHint {
+            key: "ctrl+g".to_string(),
+            wide_label: String::from("change grouping"),
+            compact_label: String::from("group"),
+            priority: 3,
+        });
+    }
+    first_row_hints.push(PickerFooterHint {
+        key: "ctrl+c".to_string(),
+        wide_label: ctrl_c_label.to_string(),
+        compact_label: ctrl_c_label.to_string(),
+        priority: 2,
+    });
+    if !state.is_agents_dashboard() {
+        first_row_hints.push(PickerFooterHint {
             key: "tab".to_string(),
             wide_label: String::from("focus sort/filter"),
             compact_label: String::from("focus"),
             priority: 7,
-        },
-    ]);
-    let option_keys = [ListAction::MoveLeft, ListAction::MoveRight]
-        .into_iter()
-        .filter_map(|action| state.list_keymap.primary_hint(action))
-        .map(super::key_hint::ShortcutHint::display_label)
-        .collect::<Vec<_>>()
-        .join("/");
-    if !option_keys.is_empty() {
-        first_row_hints.push(PickerFooterHint {
-            key: option_keys,
-            wide_label: String::from("change option"),
-            compact_label: String::from("option"),
-            priority: 8,
         });
+        let option_keys = [ListAction::MoveLeft, ListAction::MoveRight]
+            .into_iter()
+            .filter_map(|action| state.list_keymap.primary_hint(action))
+            .map(super::key_hint::ShortcutHint::display_label)
+            .collect::<Vec<_>>()
+            .join("/");
+        if !option_keys.is_empty() {
+            first_row_hints.push(PickerFooterHint {
+                key: option_keys,
+                wide_label: String::from("change option"),
+                compact_label: String::from("option"),
+                priority: 8,
+            });
+        }
     }
     let mut second_row_hints = vec![
         PickerFooterHint {
@@ -2795,6 +3511,55 @@ fn render_list(frame: &mut crate::custom_terminal::Frame, area: Rect, state: &Pi
         );
     }
 
+    if state.is_agents_dashboard() {
+        let mut lines = Vec::new();
+        for (row_idx, row) in rows.iter().enumerate() {
+            if state.starts_dashboard_group(row_idx, /*viewport_start*/ 0) {
+                let label = state.dashboard_group_label(row);
+                lines.push(vec![label.bold(), "  ─".dim()].into());
+            }
+            let is_selected = row_idx == state.selected;
+            let is_expanded =
+                is_selected && row.thread_id.is_some() && state.expanded_thread_id == row.thread_id;
+            lines.extend(render_session_lines(
+                row,
+                state,
+                is_selected,
+                is_expanded,
+                /*is_zebra*/ false,
+                area.width,
+            ));
+            if state.density == SessionListDensity::Comfortable && row_idx + 1 < rows.len() {
+                lines.push(Line::default());
+            }
+        }
+
+        let offset = state.dashboard_scroll_offset.min(lines.len());
+        for (line, y) in lines[offset..]
+            .iter()
+            .zip(content_area.y..content_area.bottom())
+        {
+            frame.render_widget_ref(line, Rect::new(area.x, y, area.width, 1));
+        }
+        if show_more_below {
+            let label = if state.pagination.is_loading() {
+                "↓ loading more"
+            } else {
+                "↓ more"
+            };
+            frame.render_widget_ref(
+                &more_line(label),
+                Rect::new(
+                    area.x,
+                    area.y.saturating_add(area.height.saturating_sub(1)),
+                    area.width,
+                    1,
+                ),
+            );
+        }
+        return;
+    }
+
     let start = state.scroll_top.min(rows.len().saturating_sub(1));
     let mut y = content_area.y;
     for (idx, row) in rows[start..].iter().enumerate() {
@@ -2802,6 +3567,15 @@ fn render_list(frame: &mut crate::custom_terminal::Frame, area: Rect, state: &Pi
             break;
         }
         let row_idx = start + idx;
+        if state.starts_dashboard_group(row_idx, start) {
+            if y >= content_area.y.saturating_add(content_area.height) {
+                break;
+            }
+            let label = state.dashboard_group_label(row);
+            let header: Line = vec![label.bold(), "  ─".dim()].into();
+            frame.render_widget_ref(&header, Rect::new(area.x, y, area.width, 1));
+            y = y.saturating_add(1);
+        }
         let is_selected = row_idx == state.selected;
         let is_expanded =
             is_selected && row.thread_id.is_some() && state.expanded_thread_id == row.thread_id;
@@ -2875,27 +3649,68 @@ fn render_comfortable_session_lines(
     is_zebra: bool,
     width: u16,
 ) -> Vec<Line<'static>> {
-    let marker = selection_marker(is_selected, is_expanded);
-    let title = truncate_text(row.display_preview(), width.saturating_sub(2) as usize);
-    let title = if is_selected {
+    let dashboard = state.is_agents_dashboard();
+    let marker = if dashboard {
+        dashboard_selection_marker(is_selected, is_expanded)
+    } else {
+        selection_marker(is_selected, is_expanded)
+    };
+    let status_width = usize::from(dashboard) * DASHBOARD_STATUS_COLUMN_WIDTH;
+    let title = truncate_text(
+        row.display_preview(),
+        width.saturating_sub(2) as usize - status_width.min(width.saturating_sub(2) as usize),
+    );
+    let title = if dashboard {
+        title.set_style(dashboard_row_text_style(is_selected))
+    } else if is_selected {
         selected_session_title_span(title)
     } else {
         title.into()
     };
-    let title_line = Line::from(vec![marker, title]);
+    let mut title_spans = vec![marker];
+    if dashboard {
+        title_spans.push(dashboard_status_column(row.dashboard_status));
+    }
+    title_spans.push(title);
+    let title_line = Line::from(title_spans);
     let mut lines = vec![title_line];
-    let row_style = if is_selected {
+    if state.is_agents_dashboard()
+        && !is_expanded
+        && let Some(thread_id) = row.thread_id
+        && let Some(subtitle) = if state.dashboard_system_errors.contains(&thread_id) {
+            Some("Thread stopped because of a system error".red())
+        } else {
+            dashboard_subtitle(state.transcript_previews.get(&thread_id))
+        }
+    {
+        lines.push(apply_dashboard_text_style(
+            vec!["  ".into(), subtitle].into(),
+            is_selected,
+        ));
+    }
+    let row_style = if dashboard {
+        None
+    } else if is_selected {
         Some(dense_selected_style())
     } else if is_zebra {
         Some(dense_zebra_style())
     } else {
         None
     };
-    if let Some(style) = row_style {
+    if !dashboard && let Some(style) = row_style {
         lines = apply_session_row_background(lines, style, width);
     }
     if is_expanded {
-        lines.extend(render_transcript_preview_lines(row, state, width));
+        let transcript_lines = render_transcript_preview_lines(row, state, width);
+        if dashboard {
+            lines.extend(
+                transcript_lines
+                    .into_iter()
+                    .map(|line| apply_dashboard_text_style(line, is_selected)),
+            );
+        } else {
+            lines.extend(transcript_lines);
+        }
         return lines;
     }
 
@@ -2913,15 +3728,37 @@ fn render_comfortable_session_lines(
         &updated,
         branch,
         cwd.as_deref(),
-        state.filter_mode == SessionFilterMode::All,
+        state.filter_mode == SessionFilterMode::All
+            && !(state.is_agents_dashboard()
+                && state.dashboard_group_mode == DashboardGroupMode::Project),
         width,
     );
-    if let Some(style) = row_style {
+    if dashboard {
+        lines.extend(
+            footer_lines
+                .into_iter()
+                .map(|line| apply_dashboard_text_style(line, is_selected)),
+        );
+    } else if let Some(style) = row_style {
         lines.extend(apply_session_row_background(footer_lines, style, width));
     } else {
         lines.extend(footer_lines);
     }
     lines
+}
+
+fn dashboard_subtitle(preview: Option<&TranscriptPreviewState>) -> Option<Span<'static>> {
+    match preview {
+        Some(TranscriptPreviewState::Loading) => Some("Loading recent activity…".italic().dim()),
+        Some(TranscriptPreviewState::Failed) => None,
+        Some(TranscriptPreviewState::Loaded(lines)) => lines
+            .iter()
+            .rev()
+            .find(|line| matches!(line.speaker, TranscriptPreviewSpeaker::Assistant))
+            .or_else(|| lines.last())
+            .map(|line| line.text.clone().dim()),
+        None => None,
+    }
 }
 
 fn apply_session_row_background(
@@ -2955,7 +3792,11 @@ fn render_dense_session_lines(
     is_zebra: bool,
     width: u16,
 ) -> Vec<Line<'static>> {
-    let marker = selection_marker(is_selected, is_expanded);
+    let marker = if state.is_agents_dashboard() {
+        dashboard_selection_marker(is_selected, is_expanded)
+    } else {
+        selection_marker(is_selected, is_expanded)
+    };
     let reference = state.relative_time_reference.unwrap_or_else(Utc::now);
     let created = format_relative_time(reference, row.created_at);
     let updated = format_relative_time(reference, row.updated_at.or(row.created_at));
@@ -2965,24 +3806,86 @@ fn render_dense_session_lines(
             updated
         }
     };
+    let title = row.display_preview().to_string();
     let mut lines = vec![dense_summary_line(DenseSummaryInput {
         marker,
         date: &date,
-        title: row.display_preview(),
+        title: &title,
+        dashboard_status: row.dashboard_status,
+        is_dashboard: state.is_agents_dashboard(),
         is_selected,
         is_zebra,
         width,
     })];
     if is_expanded {
-        lines.extend(render_transcript_preview_lines(row, state, width));
+        let transcript_lines = render_transcript_preview_lines(row, state, width);
+        if state.is_agents_dashboard() {
+            lines.extend(
+                transcript_lines
+                    .into_iter()
+                    .map(|line| apply_dashboard_text_style(line, is_selected)),
+            );
+        } else {
+            lines.extend(transcript_lines);
+        }
     }
     lines
+}
+
+fn dashboard_status_column(status: Option<DashboardStatus>) -> Span<'static> {
+    let Some(status) = status else {
+        return " ".repeat(DASHBOARD_STATUS_COLUMN_WIDTH).dim();
+    };
+    let label = format!("[{}]", status.label());
+    let padding = DASHBOARD_STATUS_COLUMN_WIDTH.saturating_sub(label.width());
+    let label = format!("{label}{}", " ".repeat(padding));
+    match status {
+        DashboardStatus::NeedsInput => label.red().bold(),
+        DashboardStatus::Working => label.cyan(),
+        DashboardStatus::Idle => label.green(),
+        DashboardStatus::Done => label.dim(),
+    }
+}
+
+fn dashboard_row_text_style(is_selected: bool) -> Style {
+    if is_selected {
+        Style::default().fg(if default_bg().is_some_and(is_light) {
+            Color::Black
+        } else {
+            Color::White
+        })
+    } else {
+        Style::default().dim()
+    }
+}
+
+fn dashboard_selection_marker(is_selected: bool, is_expanded: bool) -> Span<'static> {
+    let marker = match (is_selected, is_expanded) {
+        (true, true) => "⌄ ",
+        (true, false) => "❯ ",
+        (false, _) => "  ",
+    };
+    marker.set_style(dashboard_row_text_style(is_selected))
+}
+
+fn apply_dashboard_text_style(mut line: Line<'static>, is_selected: bool) -> Line<'static> {
+    let style = dashboard_row_text_style(is_selected);
+    for span in &mut line.spans {
+        span.style = if is_selected {
+            style
+        } else {
+            span.style.patch(style)
+        };
+    }
+    line
 }
 
 struct DenseSummaryInput<'a> {
     marker: Span<'static>,
     date: &'a str,
     title: &'a str,
+    dashboard_status: Option<DashboardStatus>,
+    is_dashboard: bool,
     is_selected: bool,
     is_zebra: bool,
     width: u16,
@@ -2991,27 +3894,37 @@ struct DenseSummaryInput<'a> {
 fn dense_summary_line(input: DenseSummaryInput<'_>) -> Line<'static> {
     let marker_width = input.marker.width();
     let available = (input.width as usize).saturating_sub(marker_width);
-    let columns = dense_columns(available);
-    let title = if input.is_selected {
+    let status_width = usize::from(input.is_dashboard) * DASHBOARD_STATUS_COLUMN_WIDTH;
+    let columns = dense_columns(available.saturating_sub(status_width));
+    let title = if input.is_dashboard {
+        truncate_text(input.title, columns.title_width)
+            .set_style(dashboard_row_text_style(input.is_selected))
+    } else if input.is_selected {
         selected_session_title_span(dense_column_text(input.title, columns.title_width))
     } else {
         dense_column_text(input.title, columns.title_width).into()
     };
 
-    let spans = vec![
-        input.marker,
-        dense_column_text(input.date, columns.date_width).dim(),
-        title,
-    ];
+    let date = if input.is_dashboard {
+        dense_column_text(input.date, columns.date_width)
+            .set_style(dashboard_row_text_style(input.is_selected))
+    } else {
+        dense_column_text(input.date, columns.date_width).dim()
+    };
+    let mut spans = vec![input.marker, date];
+    if input.is_dashboard {
+        spans.push(dashboard_status_column(input.dashboard_status));
+    }
+    spans.push(title);
     let mut line = Line::from(spans);
-    if input.is_selected {
+    if !input.is_dashboard && input.is_selected {
         let padding = (input.width as usize).saturating_sub(line.width());
         if padding > 0 {
             line.spans
                 .push(" ".repeat(padding).set_style(dense_selected_style()));
         }
         line = line.style(dense_selected_style());
-    } else if input.is_zebra {
+    } else if !input.is_dashboard && input.is_zebra {
         let padding = (input.width as usize).saturating_sub(line.width());
         if padding > 0 {
             line.spans
@@ -3574,6 +4487,7 @@ mod tests {
     ) -> PickerPage {
         PickerPage {
             rows,
+            dashboard_system_errors: HashSet::new(),
             next_cursor: next_cursor.map(|cursor| PageCursor::AppServer(cursor.to_string())),
             num_scanned_files,
             reached_scan_cap,
@@ -3619,7 +4533,1033 @@ mod tests {
             updated_at: Some(timestamp),
             cwd: None,
             git_branch: None,
+            dashboard_status: None,
         }
+    }
+
+    fn make_dashboard_row(cwd: &str, ts: &str, preview: &str, status: DashboardStatus) -> Row {
+        let mut row = make_row(
+            &format!("/tmp/{}.jsonl", preview.replace(' ', "-")),
+            ts,
+            preview,
+        );
+        row.thread_id = Some(ThreadId::new());
+        row.cwd = Some(PathBuf::from(cwd));
+        row.dashboard_status = Some(status);
+        row
+    }
+
+    fn dashboard_state(rows: Vec<Row>) -> PickerState {
+        let loader = page_only_loader(|_| {});
+        let mut state = PickerState::new(
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::MatchDefault(String::from("openai")),
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Resume,
+        );
+        state.launch_context = SessionPickerLaunchContext::AgentsDashboard;
+        let (app_event_tx, _app_event_rx) = mpsc::unbounded_channel();
+        state.initialize_dashboard_composer(
+            /*enhanced_keys_supported*/ true,
+            /*disable_paste_burst*/ true,
+            AppEventSender::new(app_event_tx),
+            Path::new("/work/invocation"),
+            &RuntimeKeymap::defaults(),
+        );
+        state.relative_time_reference =
+            Some(parse_timestamp_str("2026-04-28T16:30:00Z").expect("relative time reference"));
+        state.all_rows = rows;
+        state.apply_filter();
+        state
+    }
+
+    fn render_dashboard_list_snapshot(state: &PickerState, width: u16, height: u16) -> String {
+        use crate::custom_terminal::Terminal;
+        use crate::test_backend::VT100Backend;
+
+        let backend = VT100Backend::new(width, height);
+        let mut terminal = Terminal::with_options(backend).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, width, height));
+        {
+            let mut frame = terminal.get_frame();
+            let area = frame.area();
+            render_list(&mut frame, area, state);
+        }
+        terminal.flush().expect("flush");
+        terminal.backend().to_string()
+    }
+
+    fn render_dashboard_snapshot(state: &PickerState, width: u16, height: u16) -> String {
+        use crate::custom_terminal::Terminal;
+        use crate::test_backend::VT100Backend;
+
+        let backend = VT100Backend::new(width, height);
+        let mut terminal = Terminal::with_options(backend).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, width, height));
+        {
+            let mut frame = terminal.get_frame();
+            render_picker_frame(&mut frame, state);
+        }
+        terminal.flush().expect("flush");
+        terminal.backend().to_string()
+    }
+
+    #[tokio::test]
+    async fn dashboard_grouping_orders_rows_and_preserves_selection() {
+        let selected = make_dashboard_row(
+            "/work/older-project",
+            "2026-04-28T15:00:00Z",
+            "waiting for approval",
+            DashboardStatus::NeedsInput,
+        );
+        let selected_id = selected.thread_id;
+        let rows = vec![
+            make_dashboard_row(
+                "/work/newer-project",
+                "2026-04-28T16:20:00Z",
+                "running tests",
+                DashboardStatus::Working,
+            ),
+            selected,
+            make_dashboard_row(
+                "/work/newer-project",
+                "2026-04-28T14:00:00Z",
+                "finished refactor",
+                DashboardStatus::Done,
+            ),
+        ];
+        let mut state = dashboard_state(rows);
+        state.selected = state
+            .filtered_rows
+            .iter()
+            .position(|row| row.thread_id == selected_id)
+            .expect("selected row");
+
+        state
+            .handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+            .await
+            .expect("group toggle");
+
+        assert_eq!(state.dashboard_group_mode, DashboardGroupMode::Status);
+        assert_eq!(
+            state
+                .filtered_rows
+                .iter()
+                .map(|row| row.dashboard_status.unwrap_or(DashboardStatus::Done))
+                .collect::<Vec<_>>(),
+            vec![
+                DashboardStatus::NeedsInput,
+                DashboardStatus::Working,
+                DashboardStatus::Done,
+                DashboardStatus::Done,
+            ]
+        );
+        assert_eq!(state.filtered_rows[state.selected].thread_id, selected_id);
+    }
+
+    #[tokio::test]
+    async fn dashboard_group_slash_command_changes_mode() {
+        let mut state = dashboard_state(Vec::new());
+        state
+            .dashboard_composer
+            .as_mut()
+            .expect("dashboard composer")
+            .composer
+            .insert_str("/group status");
+
+        let selection = state
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .expect("group command");
+
+        assert!(selection.is_none());
+        assert_eq!(state.dashboard_group_mode, DashboardGroupMode::Status);
+        assert!(
+            state
+                .dashboard_composer
+                .as_ref()
+                .expect("dashboard composer")
+                .composer
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_session_only_slash_command_explains_requirement() {
+        let mut state = dashboard_state(Vec::new());
+        state
+            .dashboard_composer
+            .as_mut()
+            .expect("dashboard composer")
+            .composer
+            .insert_str("/status");
+
+        let selection = state
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .expect("status command");
+
+        assert!(selection.is_none());
+        assert_eq!(
+            state.inline_error.as_deref(),
+            Some("Open a session before running /status")
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_mention_command_keeps_editing_in_composer() {
+        let mut state = dashboard_state(Vec::new());
+        state
+            .dashboard_composer
+            .as_mut()
+            .expect("dashboard composer")
+            .composer
+            .insert_str("/mention");
+
+        let selection = state
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .expect("mention command");
+
+        assert!(selection.is_none());
+        assert_eq!(
+            state
+                .dashboard_composer
+                .as_ref()
+                .expect("dashboard composer")
+                .composer
+                .current_text_with_pending(),
+            "@"
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_nonempty_enter_starts_in_selected_project_with_full_payload() {
+        let image_path = PathBuf::from("/tmp/dashboard-image.png");
+        let rows = vec![make_dashboard_row(
+            "/work/selected",
+            "2026-04-28T16:20:00Z",
+            "selected session",
+            DashboardStatus::Idle,
+        )];
+        let mut state = dashboard_state(rows);
+        let composer = &mut state
+            .dashboard_composer
+            .as_mut()
+            .expect("dashboard composer")
+            .composer;
+        composer.insert_str("ship the dashboard");
+        composer.attach_image(image_path.clone());
+
+        let selection = state
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .expect("submit dashboard prompt")
+            .expect("session selection");
+
+        let SessionSelection::StartFreshIn { cwd, user_message } = selection else {
+            panic!("expected selected-project fresh session");
+        };
+        assert_eq!(cwd, PathBuf::from("/work/selected"));
+        assert_eq!(
+            user_message,
+            crate::chatwidget::UserMessage {
+                text: String::from("ship the dashboard[Image #1]"),
+                local_images: vec![crate::bottom_pane::LocalImageAttachment {
+                    placeholder: String::from("[Image #1]"),
+                    path: image_path,
+                }],
+                remote_image_urls: Vec::new(),
+                text_elements: vec![codex_protocol::user_input::TextElement::new(
+                    (18..28).into(),
+                    Some(String::from("[Image #1]")),
+                )],
+                mention_bindings: Vec::new(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_empty_enter_resumes_selected_session() {
+        let row = make_dashboard_row(
+            "/work/selected",
+            "2026-04-28T16:20:00Z",
+            "selected session",
+            DashboardStatus::Idle,
+        );
+        let thread_id = row.thread_id.expect("thread id");
+        let mut state = dashboard_state(vec![row]);
+
+        let selection = state
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .expect("open dashboard session")
+            .expect("session selection");
+
+        assert!(matches!(
+            selection,
+            SessionSelection::Resume(SessionTarget {
+                thread_id: selected_thread_id,
+                ..
+            }) if selected_thread_id == thread_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn dashboard_empty_right_resumes_selected_session() {
+        let row = make_dashboard_row(
+            "/work/selected",
+            "2026-04-28T16:20:00Z",
+            "selected session",
+            DashboardStatus::Idle,
+        );
+        let thread_id = row.thread_id.expect("thread id");
+        let mut state = dashboard_state(vec![row]);
+
+        let selection = state
+            .handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .await
+            .expect("open dashboard session")
+            .expect("session selection");
+
+        assert!(matches!(
+            selection,
+            SessionSelection::Resume(SessionTarget {
+                thread_id: selected_thread_id,
+                ..
+            }) if selected_thread_id == thread_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn dashboard_composer_popup_has_priority_over_row_navigation() {
+        let mut state = dashboard_state(vec![
+            make_dashboard_row(
+                "/work/first",
+                "2026-04-28T16:20:00Z",
+                "first",
+                DashboardStatus::Working,
+            ),
+            make_dashboard_row(
+                "/work/second",
+                "2026-04-28T16:10:00Z",
+                "second",
+                DashboardStatus::Idle,
+            ),
+        ]);
+        let composer = &mut state
+            .dashboard_composer
+            .as_mut()
+            .expect("dashboard composer")
+            .composer;
+        composer.insert_str("/");
+        composer.sync_popups();
+        assert!(composer.popup_active());
+
+        state
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .expect("move slash command selection");
+
+        assert_eq!(state.selected, 0);
+    }
+
+    #[tokio::test]
+    async fn dashboard_ctrl_navigation_changes_selection_with_a_draft() {
+        let mut state = dashboard_state(vec![
+            make_dashboard_row(
+                "/work/first",
+                "2026-04-28T16:20:00Z",
+                "first",
+                DashboardStatus::Working,
+            ),
+            make_dashboard_row(
+                "/work/second",
+                "2026-04-28T16:10:00Z",
+                "second",
+                DashboardStatus::Idle,
+            ),
+        ]);
+        state
+            .dashboard_composer
+            .as_mut()
+            .expect("dashboard composer")
+            .composer
+            .insert_str("draft");
+
+        state
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL))
+            .await
+            .expect("move selection");
+
+        assert_eq!(state.selected, 1);
+        assert_eq!(
+            state
+                .dashboard_composer
+                .as_ref()
+                .expect("dashboard composer")
+                .composer
+                .current_text_with_pending(),
+            "draft"
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_search_filters_sessions_without_replacing_composer_draft() {
+        let mut state = dashboard_state(vec![
+            make_dashboard_row(
+                "/work/first",
+                "2026-04-28T16:20:00Z",
+                "alpha task",
+                DashboardStatus::Working,
+            ),
+            make_dashboard_row(
+                "/work/second",
+                "2026-04-28T16:10:00Z",
+                "beta task",
+                DashboardStatus::Idle,
+            ),
+        ]);
+        state
+            .dashboard_composer
+            .as_mut()
+            .expect("dashboard composer")
+            .composer
+            .insert_str("draft prompt");
+
+        state
+            .handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
+            .await
+            .expect("activate search");
+        for character in "beta".chars() {
+            state
+                .handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .await
+                .expect("type search");
+        }
+
+        assert_eq!(
+            state
+                .filtered_rows
+                .iter()
+                .map(Row::display_preview)
+                .collect::<Vec<_>>(),
+            vec!["beta task"]
+        );
+        assert_eq!(
+            state
+                .dashboard_composer
+                .as_ref()
+                .expect("dashboard composer")
+                .composer
+                .current_text_with_pending(),
+            "draft prompt"
+        );
+    }
+
+    #[test]
+    fn dashboard_keeps_invocation_directory_as_empty_project_fallback() {
+        let state = dashboard_state(Vec::new());
+
+        assert_eq!(
+            state
+                .filtered_rows
+                .iter()
+                .map(|row| (row.cwd.as_deref(), row.thread_id, row.display_preview(),))
+                .collect::<Vec<_>>(),
+            vec![(
+                Some(Path::new("/work/invocation")),
+                None,
+                "Start a new agent",
+            )]
+        );
+    }
+
+    #[test]
+    fn dashboard_lazily_requests_and_caches_visible_subtitles() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_sink = Arc::clone(&requests);
+        let loader: PickerLoader = Arc::new(move |request| {
+            request_sink.lock().expect("request log").push(request);
+        });
+        let mut state = PickerState::new(
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::MatchDefault(String::from("openai")),
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Resume,
+        );
+        state.launch_context = SessionPickerLaunchContext::AgentsDashboard;
+        state.all_rows = vec![
+            make_dashboard_row(
+                "/work/first",
+                "2026-04-28T16:20:00Z",
+                "first",
+                DashboardStatus::Working,
+            ),
+            make_dashboard_row(
+                "/work/second",
+                "2026-04-28T16:10:00Z",
+                "second",
+                DashboardStatus::Idle,
+            ),
+        ];
+        state.apply_filter();
+
+        state.update_viewport(/*rows*/ 1, /*width*/ 80);
+        state.update_viewport(/*rows*/ 1, /*width*/ 80);
+
+        let requested = requests
+            .lock()
+            .expect("request log")
+            .iter()
+            .filter_map(|request| match request {
+                PickerLoadRequest::Preview { thread_id } => Some(*thread_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requested,
+            vec![state.filtered_rows[0].thread_id.expect("thread")]
+        );
+
+        let thread_id = requested[0];
+        state.transcript_previews.insert(
+            thread_id,
+            TranscriptPreviewState::Loaded(vec![TranscriptPreviewLine {
+                speaker: TranscriptPreviewSpeaker::Assistant,
+                text: String::from("Latest assistant update"),
+            }]),
+        );
+        assert_eq!(
+            dashboard_subtitle(state.transcript_previews.get(&thread_id)),
+            Some("Latest assistant update".dim())
+        );
+    }
+
+    #[test]
+    fn dashboard_reloads_composer_inventory_when_selected_project_changes() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_sink = Arc::clone(&requests);
+        let loader: PickerLoader = Arc::new(move |request| {
+            request_sink.lock().expect("request log").push(request);
+        });
+        let mut state = PickerState::new(
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::MatchDefault(String::from("openai")),
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Resume,
+        );
+        state.launch_context = SessionPickerLaunchContext::AgentsDashboard;
+        state.all_rows = vec![
+            make_dashboard_row(
+                "/work/first",
+                "2026-04-28T16:20:00Z",
+                "first",
+                DashboardStatus::Working,
+            ),
+            make_dashboard_row(
+                "/work/second",
+                "2026-04-28T16:10:00Z",
+                "second",
+                DashboardStatus::Idle,
+            ),
+        ];
+        state.apply_filter();
+
+        state.load_dashboard_composer_inventory();
+        state.move_dashboard_selection(/*down*/ true);
+        state.move_dashboard_selection(/*down*/ false);
+
+        let requested = requests
+            .lock()
+            .expect("request log")
+            .iter()
+            .filter_map(|request| match request {
+                PickerLoadRequest::DashboardComposerInventory { cwd } => Some(cwd.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requested,
+            vec![
+                PathBuf::from("/work/first"),
+                PathBuf::from("/work/second"),
+                PathBuf::from("/work/first"),
+            ]
+        );
+    }
+
+    #[test]
+    fn dashboard_applies_live_status_name_and_archive_notifications() {
+        let row = make_dashboard_row(
+            "/work/project",
+            "2026-04-28T16:00:00Z",
+            "original preview",
+            DashboardStatus::Idle,
+        );
+        let thread_id = row.thread_id.expect("thread id");
+        let mut state = dashboard_state(vec![row]);
+
+        state.handle_app_server_event(AppServerEvent::ServerNotification(Box::new(
+            ServerNotification::ThreadStatusChanged(
+                codex_app_server_protocol::ThreadStatusChangedNotification {
+                    thread_id: thread_id.to_string(),
+                    status: codex_app_server_protocol::ThreadStatus::Active {
+                        active_flags: vec![
+                            codex_app_server_protocol::ThreadActiveFlag::WaitingOnApproval,
+                        ],
+                    },
+                },
+            ),
+        )));
+        state.handle_app_server_event(AppServerEvent::ServerNotification(Box::new(
+            ServerNotification::ThreadNameUpdated(
+                codex_app_server_protocol::ThreadNameUpdatedNotification {
+                    thread_id: thread_id.to_string(),
+                    thread_name: Some(String::from("renamed session")),
+                },
+            ),
+        )));
+
+        assert_eq!(
+            (
+                state.filtered_rows[0].dashboard_status,
+                state.filtered_rows[0].thread_name.as_deref(),
+            ),
+            (Some(DashboardStatus::NeedsInput), Some("renamed session"))
+        );
+
+        state.handle_app_server_event(AppServerEvent::ServerNotification(Box::new(
+            ServerNotification::ThreadArchived(
+                codex_app_server_protocol::ThreadArchivedNotification {
+                    thread_id: thread_id.to_string(),
+                },
+            ),
+        )));
+
+        assert_eq!(
+            state
+                .filtered_rows
+                .iter()
+                .map(Row::display_preview)
+                .collect::<Vec<_>>(),
+            vec!["Start a new agent"]
+        );
+    }
+
+    #[test]
+    fn dashboard_system_error_uses_error_specific_subtitle() {
+        let row = make_dashboard_row(
+            "/work/selected",
+            "2026-04-28T16:20:00Z",
+            "selected session",
+            DashboardStatus::Working,
+        );
+        let thread_id = row.thread_id.expect("thread id");
+        let mut state = dashboard_state(vec![row]);
+
+        state.handle_app_server_event(AppServerEvent::ServerNotification(Box::new(
+            ServerNotification::ThreadStatusChanged(
+                codex_app_server_protocol::ThreadStatusChangedNotification {
+                    thread_id: thread_id.to_string(),
+                    status: codex_app_server_protocol::ThreadStatus::SystemError,
+                },
+            ),
+        )));
+
+        assert_eq!(
+            state.filtered_rows[0].dashboard_status,
+            Some(DashboardStatus::NeedsInput)
+        );
+        assert_eq!(
+            render_comfortable_session_lines(
+                &state.filtered_rows[0],
+                &state,
+                /*is_selected*/ false,
+                /*is_expanded*/ false,
+                /*is_zebra*/ false,
+                /*width*/ 80,
+            )[1]
+            .to_string(),
+            "  Thread stopped because of a system error"
+        );
+    }
+
+    #[test]
+    fn dashboard_initial_page_system_error_uses_error_specific_subtitle() {
+        let row = make_dashboard_row(
+            "/work/selected",
+            "2026-04-28T16:20:00Z",
+            "selected session",
+            DashboardStatus::NeedsInput,
+        );
+        let thread_id = row.thread_id.expect("thread id");
+        let mut state = dashboard_state(Vec::new());
+
+        state.ingest_page(PickerPage {
+            rows: vec![row],
+            dashboard_system_errors: HashSet::from([thread_id]),
+            next_cursor: None,
+            num_scanned_files: 1,
+            reached_scan_cap: false,
+        });
+
+        assert_eq!(
+            render_comfortable_session_lines(
+                &state.filtered_rows[0],
+                &state,
+                /*is_selected*/ false,
+                /*is_expanded*/ false,
+                /*is_zebra*/ false,
+                /*width*/ 80,
+            )[1]
+            .to_string(),
+            "  Thread stopped because of a system error"
+        );
+    }
+
+    #[test]
+    fn dashboard_status_change_invalidates_cached_subtitle() {
+        let row = make_dashboard_row(
+            "/work/project",
+            "2026-04-28T16:00:00Z",
+            "original preview",
+            DashboardStatus::Working,
+        );
+        let thread_id = row.thread_id.expect("thread id");
+        let mut state = dashboard_state(vec![row]);
+        state.transcript_previews.insert(
+            thread_id,
+            TranscriptPreviewState::Loaded(vec![TranscriptPreviewLine {
+                speaker: TranscriptPreviewSpeaker::Assistant,
+                text: String::from("stale assistant update"),
+            }]),
+        );
+
+        state.handle_app_server_event(AppServerEvent::ServerNotification(Box::new(
+            ServerNotification::ThreadStatusChanged(
+                codex_app_server_protocol::ThreadStatusChangedNotification {
+                    thread_id: thread_id.to_string(),
+                    status: codex_app_server_protocol::ThreadStatus::Idle,
+                },
+            ),
+        )));
+
+        assert!(!state.transcript_previews.contains_key(&thread_id));
+    }
+
+    #[tokio::test]
+    async fn dashboard_disconnect_preserves_view_state_for_reconnect() {
+        let row = make_dashboard_row(
+            "/work/selected",
+            "2026-04-28T16:20:00Z",
+            "selected session",
+            DashboardStatus::Working,
+        );
+        let selected_thread_id = row.thread_id;
+        let mut state = dashboard_state(vec![row]);
+        state.dashboard_group_mode = DashboardGroupMode::Status;
+        state
+            .dashboard_composer
+            .as_mut()
+            .expect("dashboard composer")
+            .composer
+            .insert_str("preserved draft");
+
+        let selection = state
+            .handle_background_event(BackgroundEvent::AppServer(AppServerEvent::Disconnected {
+                message: String::from("daemon restarted"),
+            }))
+            .await
+            .expect("disconnect handling");
+
+        let Some(SessionSelection::ReconnectDashboard(resume_state)) = selection else {
+            panic!("expected dashboard reconnect state");
+        };
+        assert_eq!(
+            resume_state,
+            DashboardResumeState {
+                draft: String::from("preserved draft"),
+                group_mode: DashboardGroupMode::Status,
+                selected_thread_id,
+                selected_cwd: Some(PathBuf::from("/work/selected")),
+            }
+        );
+        assert_eq!(
+            state.inline_error.as_deref(),
+            Some("Dashboard disconnected: daemon restarted")
+        );
+    }
+
+    #[test]
+    fn agents_dashboard_project_grouping_snapshot() {
+        let mut state = dashboard_state(vec![
+            make_dashboard_row(
+                "/Users/majd/Projects/claudex",
+                "2026-04-28T16:29:18Z",
+                "Build the agents dashboard",
+                DashboardStatus::Working,
+            ),
+            make_dashboard_row(
+                "/Users/majd/Projects/claudex",
+                "2026-04-28T15:54:00Z",
+                "Review daemon lifecycle",
+                DashboardStatus::NeedsInput,
+            ),
+            make_dashboard_row(
+                "/Users/majd/Projects/site",
+                "2026-04-28T14:30:00Z",
+                "Update landing page",
+                DashboardStatus::Idle,
+            ),
+            make_dashboard_row(
+                "/Users/majd/Projects/archive",
+                "2026-04-27T11:00:00Z",
+                "Old completed task",
+                DashboardStatus::Done,
+            ),
+        ]);
+        state.update_viewport(/*rows*/ 18, /*width*/ 92);
+
+        assert_snapshot!(
+            "agents_dashboard_project_grouping",
+            render_dashboard_list_snapshot(&state, /*width*/ 92, /*height*/ 18)
+        );
+    }
+
+    #[test]
+    fn agents_dashboard_scrolls_by_rendered_lines_snapshot() {
+        let mut state = dashboard_state(vec![
+            make_dashboard_row(
+                "/Users/majd/Projects/claudex",
+                "2026-04-28T16:29:18Z",
+                "Build the agents dashboard",
+                DashboardStatus::Working,
+            ),
+            make_dashboard_row(
+                "/Users/majd/Projects/claudex",
+                "2026-04-28T16:20:00Z",
+                "Polish dashboard scrolling",
+                DashboardStatus::Working,
+            ),
+            make_dashboard_row(
+                "/Users/majd/Projects/claudex",
+                "2026-04-28T16:10:00Z",
+                "Add dashboard snapshots",
+                DashboardStatus::Idle,
+            ),
+        ]);
+        state.update_viewport(/*rows*/ 7, /*width*/ 92);
+        state.move_dashboard_selection(/*down*/ true);
+
+        assert_eq!(state.dashboard_scroll_offset, 2);
+        assert_eq!(state.scroll_top, 0);
+        assert_snapshot!(
+            "agents_dashboard_scrolls_by_rendered_lines",
+            render_dashboard_list_snapshot(&state, /*width*/ 92, /*height*/ 7)
+        );
+    }
+
+    #[test]
+    fn agents_dashboard_composer_snapshot() {
+        let mut state = dashboard_state(vec![make_dashboard_row(
+            "/Users/majd/Projects/claudex",
+            "2026-04-28T16:29:18Z",
+            "Build the agents dashboard",
+            DashboardStatus::Working,
+        )]);
+        state
+            .dashboard_composer
+            .as_mut()
+            .expect("dashboard composer")
+            .composer
+            .insert_str("Add project-aware session creation");
+        state.update_viewport(/*rows*/ 12, /*width*/ 80);
+
+        assert_snapshot!(
+            "agents_dashboard_composer",
+            render_dashboard_snapshot(&state, /*width*/ 80, /*height*/ 20)
+        );
+    }
+
+    #[test]
+    fn agents_dashboard_status_grouping_narrow_snapshot() {
+        let mut state = dashboard_state(vec![
+            make_dashboard_row(
+                "/a/very/long/project/path/that/will/not/fit",
+                "2026-04-28T16:29:18Z",
+                "Approve deployment to production",
+                DashboardStatus::NeedsInput,
+            ),
+            make_dashboard_row(
+                "/Users/majd/Projects/claudex",
+                "2026-04-28T16:20:00Z",
+                "Implement live status notifications",
+                DashboardStatus::Working,
+            ),
+            make_dashboard_row(
+                "/Users/majd/Projects/site",
+                "2026-04-28T14:30:00Z",
+                "Waiting for next prompt",
+                DashboardStatus::Idle,
+            ),
+            make_dashboard_row(
+                "/Users/majd/Projects/archive",
+                "2026-04-27T11:00:00Z",
+                "Finished cleanup",
+                DashboardStatus::Done,
+            ),
+        ]);
+        state.dashboard_group_mode = DashboardGroupMode::Status;
+        state.sort_dashboard_rows();
+        state.update_viewport(/*rows*/ 15, /*width*/ 48);
+
+        assert_snapshot!(
+            "agents_dashboard_status_grouping_narrow",
+            render_dashboard_list_snapshot(&state, /*width*/ 48, /*height*/ 15)
+        );
+    }
+
+    #[test]
+    fn agents_dashboard_dense_columns_snapshot() {
+        let mut state = dashboard_state(vec![
+            make_dashboard_row(
+                "/work/one",
+                "2026-04-28T16:29:18Z",
+                "Short title",
+                DashboardStatus::NeedsInput,
+            ),
+            make_dashboard_row(
+                "/work/two",
+                "2026-04-28T16:20:00Z",
+                "A much longer title that still begins in the same column",
+                DashboardStatus::Working,
+            ),
+            make_dashboard_row(
+                "/work/three",
+                "2026-04-28T16:10:00Z",
+                "Idle task",
+                DashboardStatus::Idle,
+            ),
+            make_dashboard_row(
+                "/work/four",
+                "2026-04-28T16:00:00Z",
+                "Completed task",
+                DashboardStatus::Done,
+            ),
+        ]);
+        state.density = SessionListDensity::Dense;
+        state.update_viewport(/*rows*/ 12, /*width*/ 88);
+
+        assert_snapshot!(
+            "agents_dashboard_dense_columns",
+            render_dashboard_list_snapshot(&state, /*width*/ 88, /*height*/ 12)
+        );
+    }
+
+    #[test]
+    fn agents_dashboard_rows_use_status_colors_and_selection_contrast() {
+        let statuses = [
+            DashboardStatus::NeedsInput,
+            DashboardStatus::Working,
+            DashboardStatus::Idle,
+            DashboardStatus::Done,
+        ];
+        let mut state = dashboard_state(
+            statuses
+                .into_iter()
+                .enumerate()
+                .map(|(index, status)| {
+                    make_dashboard_row(
+                        &format!("/work/{index}"),
+                        "2026-04-28T16:20:00Z",
+                        &format!("task {index}"),
+                        status,
+                    )
+                })
+                .collect(),
+        );
+        state.sort_dashboard_rows();
+
+        let rendered = state
+            .filtered_rows
+            .iter()
+            .filter(|row| row.dashboard_status.is_some())
+            .enumerate()
+            .map(|(index, row)| {
+                render_comfortable_session_lines(
+                    row,
+                    &state,
+                    index == 0,
+                    /*is_expanded*/ false,
+                    /*is_zebra*/ false,
+                    /*width*/ 80,
+                )[0]
+                .clone()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered
+                .iter()
+                .map(|line| (
+                    line.spans[..2].iter().map(Span::width).sum::<usize>(),
+                    line.spans[1].style.fg,
+                    line.spans[2].style.fg,
+                    line.spans[2]
+                        .style
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::DIM),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    16,
+                    Some(Color::Red),
+                    dashboard_row_text_style(true).fg,
+                    false
+                ),
+                (16, Some(Color::Cyan), None, true),
+                (16, Some(Color::Green), None, true),
+                (16, None, None, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn agents_dashboard_empty_snapshot() {
+        let mut state = dashboard_state(Vec::new());
+        state.update_viewport(/*rows*/ 4, /*width*/ 48);
+
+        assert_snapshot!(
+            "agents_dashboard_empty",
+            render_dashboard_list_snapshot(&state, /*width*/ 48, /*height*/ 4)
+        );
+    }
+
+    #[test]
+    fn agents_dashboard_system_error_snapshot() {
+        let row = make_dashboard_row(
+            "/Users/majd/Projects/claudex",
+            "2026-04-28T16:29:18Z",
+            "Recover disconnected daemon",
+            DashboardStatus::NeedsInput,
+        );
+        let thread_id = row.thread_id.expect("thread id");
+        let mut state = dashboard_state(vec![row]);
+        state.dashboard_system_errors.insert(thread_id);
+        state.update_viewport(/*rows*/ 6, /*width*/ 72);
+
+        assert_snapshot!(
+            "agents_dashboard_system_error",
+            render_dashboard_list_snapshot(&state, /*width*/ 72, /*height*/ 6)
+        );
     }
 
     fn local_db_first_state() -> (PickerState, Arc<Mutex<Vec<PageLoadRequest>>>) {
@@ -3683,6 +5623,7 @@ mod tests {
             updated_at: None,
             cwd: None,
             git_branch: None,
+            dashboard_status: None,
         };
 
         assert_eq!(row.display_preview(), "My session");
@@ -3877,6 +5818,7 @@ mod tests {
             updated_at: None,
             cwd: Some(PathBuf::from("/tmp/codex-session-picker")),
             git_branch: Some(String::from("fcoury/session-picker")),
+            dashboard_status: None,
         };
 
         assert!(row.matches_query("session-picker"));
@@ -3937,6 +5879,7 @@ mod tests {
             updated_at: parse_timestamp_str("2026-05-02T14:48:19Z"),
             cwd: Some(PathBuf::from("/Users/felipe.coury/code/codex")),
             git_branch: Some(String::from("codex/raw-scrollback-mode")),
+            dashboard_status: None,
         };
 
         let rendered = render_expanded_session_details(&row, &state, /*width*/ 120)
@@ -4152,6 +6095,7 @@ mod tests {
             updated_at: None,
             cwd: Some(PathBuf::from("/srv/real-project")),
             git_branch: None,
+            dashboard_status: None,
         };
 
         assert!(state.row_matches_filter(&row));
@@ -4177,6 +6121,7 @@ mod tests {
             updated_at: None,
             cwd: Some(PathBuf::from("/srv/remote-project")),
             git_branch: None,
+            dashboard_status: None,
         };
 
         assert!(state.row_matches_filter(&row));
@@ -4208,6 +6153,7 @@ mod tests {
                 updated_at: Some(now - Duration::seconds(42)),
                 cwd: None,
                 git_branch: None,
+                dashboard_status: None,
             },
             Row {
                 path: Some(PathBuf::from("/tmp/b.jsonl")),
@@ -4218,6 +6164,7 @@ mod tests {
                 updated_at: Some(now - Duration::minutes(35)),
                 cwd: None,
                 git_branch: None,
+                dashboard_status: None,
             },
             Row {
                 path: Some(PathBuf::from("/tmp/c.jsonl")),
@@ -4228,6 +6175,7 @@ mod tests {
                 updated_at: Some(now - Duration::hours(2)),
                 cwd: None,
                 git_branch: None,
+                dashboard_status: None,
             },
         ];
         state.all_rows = rows.clone();
@@ -4669,6 +6617,7 @@ mod tests {
             updated_at: None,
             cwd: None,
             git_branch: None,
+            dashboard_status: None,
         }];
 
         state
@@ -4707,6 +6656,7 @@ mod tests {
                 updated_at: None,
                 cwd: None,
                 git_branch: None,
+                dashboard_status: None,
             },
             Row {
                 path: None,
@@ -4717,6 +6667,7 @@ mod tests {
                 updated_at: None,
                 cwd: None,
                 git_branch: None,
+                dashboard_status: None,
             },
         ];
         state.pending_transcript_open = Some(thread_id);
@@ -4841,6 +6792,7 @@ mod tests {
                 updated_at: None,
                 cwd: None,
                 git_branch: None,
+                dashboard_status: None,
             },
             Row {
                 path: None,
@@ -4851,6 +6803,7 @@ mod tests {
                 updated_at: None,
                 cwd: None,
                 git_branch: None,
+                dashboard_status: None,
             },
         ];
         state.update_viewport(/*rows*/ 7, /*width*/ 80);
@@ -4906,6 +6859,7 @@ mod tests {
             updated_at: None,
             cwd: None,
             git_branch: None,
+            dashboard_status: None,
         }];
 
         state
@@ -4936,6 +6890,7 @@ mod tests {
             updated_at: None,
             cwd: None,
             git_branch: None,
+            dashboard_status: None,
         }];
 
         state
@@ -5012,6 +6967,7 @@ mod tests {
             updated_at: None,
             cwd: None,
             git_branch: None,
+            dashboard_status: None,
         }];
         state.transcript_cells.insert(
             thread_id,
@@ -5176,6 +7132,7 @@ session_picker_view = "dense"
             updated_at: None,
             cwd: None,
             git_branch: None,
+            dashboard_status: None,
         }];
 
         state
@@ -5215,6 +7172,7 @@ session_picker_view = "dense"
             updated_at: None,
             cwd: None,
             git_branch: None,
+            dashboard_status: None,
         }];
 
         state
@@ -5294,6 +7252,7 @@ session_picker_view = "dense"
                 "/Users/felipe.coury/code/codex.fcoury-session-picker/codex-rs",
             )),
             git_branch: Some(String::from("fcoury/session-picker")),
+            dashboard_status: None,
         }
     }
 
@@ -5426,6 +7385,8 @@ session_picker_view = "dense"
             marker: selection_marker(/*is_selected*/ true, /*is_expanded*/ false),
             date: "15m ago",
             title: "Selected dense row",
+            dashboard_status: None,
+            is_dashboard: false,
             is_selected: true,
             is_zebra: false,
             width: 80,
@@ -5442,6 +7403,8 @@ session_picker_view = "dense"
             marker: selection_marker(/*is_selected*/ false, /*is_expanded*/ false),
             date: "15m ago",
             title: "Zebra dense row",
+            dashboard_status: None,
+            is_dashboard: false,
             is_selected: false,
             is_zebra: true,
             width: 80,
@@ -5546,6 +7509,7 @@ session_picker_view = "dense"
             updated_at: parse_timestamp_str("2026-04-28T17:45:00Z"),
             cwd: Some(PathBuf::from("/tmp/codex")),
             git_branch: Some(String::from("fcoury/session-picker")),
+            dashboard_status: None,
         };
         let mut state = PickerState::new(
             FrameRequester::test_dummy(),
@@ -5615,6 +7579,7 @@ session_picker_view = "dense"
             updated_at: parse_timestamp_str("2026-04-28T17:45:00Z"),
             cwd: Some(PathBuf::from("/tmp/codex")),
             git_branch: Some(String::from("fcoury/session-picker")),
+            dashboard_status: None,
         };
         let mut state = PickerState::new(
             FrameRequester::test_dummy(),
@@ -5673,6 +7638,7 @@ session_picker_view = "dense"
                 updated_at: Some(now - Duration::minutes(idx * 5)),
                 cwd: None,
                 git_branch: None,
+                dashboard_status: None,
             })
             .collect();
         state.filtered_rows = state.all_rows.clone();
@@ -5725,6 +7691,7 @@ session_picker_view = "dense"
                 updated_at: Some(now - Duration::minutes(idx * 5)),
                 cwd: None,
                 git_branch: None,
+                dashboard_status: None,
             })
             .collect();
         state.filtered_rows = state.all_rows.clone();
@@ -5919,8 +7886,14 @@ session_picker_view = "dense"
 
     #[test]
     fn list_viewport_width_matches_rendered_list_inset() {
-        assert_eq!(list_viewport_width(/*width*/ 80), 76);
-        assert_eq!(list_viewport_width(/*width*/ 3), 0);
+        let dashboard = dashboard_state(Vec::new());
+        let mut regular = dashboard_state(Vec::new());
+        regular.launch_context = SessionPickerLaunchContext::Startup;
+
+        assert_eq!(list_viewport_width(/*width*/ 80, &regular), 76);
+        assert_eq!(list_viewport_width(/*width*/ 3, &regular), 0);
+        assert_eq!(list_viewport_width(/*width*/ 80, &dashboard), 78);
+        assert_eq!(list_viewport_width(/*width*/ 3, &dashboard), 1);
     }
 
     #[tokio::test]
@@ -6291,6 +8264,7 @@ session_picker_view = "dense"
             updated_at: None,
             cwd: None,
             git_branch: None,
+            dashboard_status: None,
         };
         state.all_rows = vec![row.clone()];
         state.filtered_rows = vec![row];
@@ -6330,6 +8304,7 @@ session_picker_view = "dense"
             updated_at: None,
             cwd: None,
             git_branch: None,
+            dashboard_status: None,
         };
         state.all_rows = vec![row.clone()];
         state.filtered_rows = vec![row];
@@ -6380,7 +8355,15 @@ session_picker_view = "dense"
             turns: Vec::new(),
         };
 
-        let row = row_from_app_server_thread(thread).expect("row should be preserved");
+        let mut child_thread = thread.clone();
+        child_thread.parent_thread_id = Some(ThreadId::new().to_string());
+        assert!(dashboard_thread_is_root(&thread));
+        assert!(!dashboard_thread_is_root(&child_thread));
+        assert!(thread_visible_in_picker(&child_thread, false));
+        assert!(!thread_visible_in_picker(&child_thread, true));
+
+        let row = row_from_app_server_thread(thread, /*show_dashboard_status*/ false)
+            .expect("row should be preserved");
 
         assert_eq!(row.path, None);
         assert_eq!(row.thread_id, Some(thread_id));

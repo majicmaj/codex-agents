@@ -109,7 +109,7 @@ impl App {
                 .await;
             }
             AppEvent::OpenResumePicker => {
-                let picker_app_server = match crate::start_app_server_for_picker(
+                let mut picker_app_server = match crate::start_app_server_for_picker(
                     &self.config,
                     &self.app_server_target,
                     self.state_db.clone(),
@@ -126,18 +126,55 @@ impl App {
                         return Ok(AppRunControl::Continue);
                     }
                 };
-                match crate::resume_picker::run_resume_picker_from_existing_session_with_app_server(
-                    tui,
-                    &self.config,
-                    /*show_all*/ false,
-                    /*include_non_interactive*/ false,
-                    picker_app_server,
-                    app_server.request_handle(),
-                    self.primary_thread_id
-                        .or(self.current_displayed_thread_id()),
-                )
-                .await?
-                {
+                let selection = if self.agents_dashboard {
+                    let mut dashboard_resume_state =
+                        crate::resume_picker::DashboardResumeState::default();
+                    loop {
+                        let selection = crate::dashboard::run(
+                            tui,
+                            &self.config,
+                            picker_app_server,
+                            dashboard_resume_state,
+                        )
+                        .await?;
+                        dashboard_resume_state = match selection {
+                            SessionSelection::ReconnectDashboard(state) => state,
+                            selection => break selection,
+                        };
+                        picker_app_server = match crate::reconnect_app_server_for_dashboard(
+                            &self.config,
+                            &self.app_server_target,
+                            self.state_db.clone(),
+                            self.environment_manager.clone(),
+                        )
+                        .await
+                        {
+                            Ok(app_server) => app_server,
+                            Err(err) => {
+                                self.chat_widget.add_error_message(format!(
+                                    "Failed to reconnect the agents dashboard: {err}"
+                                ));
+                                return Ok(AppRunControl::Continue);
+                            }
+                        };
+                    }
+                } else {
+                    crate::resume_picker::run_resume_picker_from_existing_session_with_app_server(
+                        tui,
+                        &self.config,
+                        /*show_all*/ false,
+                        /*include_non_interactive*/ false,
+                        picker_app_server,
+                        app_server.request_handle(),
+                        self.primary_thread_id
+                            .or(self.current_displayed_thread_id()),
+                    )
+                    .await?
+                };
+                match selection {
+                    SessionSelection::ReconnectDashboard(_) => {
+                        unreachable!("dashboard reconnect is handled before session selection")
+                    }
                     SessionSelection::Resume(target_session) => {
                         match self
                             .resume_target_session(tui, app_server, target_session)
@@ -148,6 +185,37 @@ impl App {
                                 return Ok(AppRunControl::Exit(reason));
                             }
                         }
+                    }
+                    SessionSelection::StartFreshIn { cwd, user_message } => {
+                        let current_cwd = self.config.cwd.to_path_buf();
+                        let mut config = match self
+                            .rebuild_config_for_resume_or_fallback(&current_cwd, cwd)
+                            .await
+                        {
+                            Ok(config) => config,
+                            Err(err) => {
+                                self.chat_widget.add_error_message(format!(
+                                    "Failed to rebuild configuration for the selected project: {err}"
+                                ));
+                                return Ok(AppRunControl::Continue);
+                            }
+                        };
+                        self.apply_runtime_policy_overrides(&mut config);
+                        self.config = config;
+                        tui.set_notification_settings(
+                            self.config.tui_notifications.method,
+                            self.config.tui_notifications.condition,
+                        );
+                        self.file_search
+                            .update_search_dir(self.config.cwd.to_path_buf());
+                        self.start_fresh_session_with_summary_hint(
+                            tui,
+                            app_server,
+                            /*session_start_source*/ None,
+                            Some(user_message),
+                            /*new_thread_name*/ None,
+                        )
+                        .await;
                     }
                     SessionSelection::Exit | SessionSelection::StartFresh => {
                         self.refresh_in_memory_config_from_disk_best_effort(

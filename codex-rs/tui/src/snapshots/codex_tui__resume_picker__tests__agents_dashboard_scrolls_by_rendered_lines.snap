@@ -1,0 +1,11 @@
+---
+source: tui/src/resume_picker.rs
+expression: "render_dashboard_list_snapshot(&state, 92, 7)"
+---
+↑ more
+  Loading recent activity…
+  42s ago        no branch
+
+❯ [Working]     Polish dashboard scrolling
+  Loading recent activity…
+↓ more

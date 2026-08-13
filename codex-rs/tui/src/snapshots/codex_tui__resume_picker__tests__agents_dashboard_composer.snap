@@ -1,0 +1,24 @@
+---
+source: tui/src/resume_picker.rs
+expression: "render_dashboard_snapshot(&state, 80, 20)"
+---
+ Codex Agents
+
+ Ctrl+F search sessions                                        Group: [project]
+
+ ~/Projects/claudex  ─
+ ❯ [Working]     Build the agents dashboard
+   Loading recent activity…
+   42s ago        no branch
+
+ /work/invocation  ─
+                 Start a new agent
+   -              no branch
+
+
+
+
+
+› Add project-aware session creation
+
+   enter start agent    ctrl+g group    ctrl+↑/↓ select project

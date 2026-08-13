@@ -37,6 +37,9 @@ _SPEC.loader.exec_module(_BUILD_MODULE)
 PACKAGE_NATIVE_COMPONENTS = getattr(_BUILD_MODULE, "PACKAGE_NATIVE_COMPONENTS", {})
 PACKAGE_EXPANSIONS = getattr(_BUILD_MODULE, "PACKAGE_EXPANSIONS", {})
 CODEX_PLATFORM_PACKAGES = getattr(_BUILD_MODULE, "CODEX_PLATFORM_PACKAGES", {})
+ALL_PLATFORM_PACKAGES = getattr(
+    _BUILD_MODULE, "ALL_PLATFORM_PACKAGES", CODEX_PLATFORM_PACKAGES
+)
 CODEX_PACKAGE_COMPONENT = getattr(
     _BUILD_MODULE, "CODEX_PACKAGE_COMPONENT", "codex-package"
 )
@@ -472,7 +475,7 @@ def run_command(cmd: list[str]) -> None:
 
 
 def tarball_name_for_package(package: str, version: str) -> str:
-    if package in CODEX_PLATFORM_PACKAGES:
+    if package in ALL_PLATFORM_PACKAGES:
         platform = package.removeprefix("codex-")
         return f"codex-npm-{platform}-{version}.tgz"
     return f"{package}-npm-{version}.tgz"

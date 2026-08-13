@@ -177,6 +177,10 @@ impl App {
         // editing behavior for moving across words inside a draft.
         let allow_agent_word_motion_fallback = !self.enhanced_keys_supported
             && self.chat_widget.composer_text_with_pending().is_empty();
+        if self.should_return_to_agents_dashboard(key_event) {
+            self.app_event_tx.send(AppEvent::OpenResumePicker);
+            return;
+        }
         if self.overlay.is_none()
             && self.chat_widget.no_modal_or_popup_active()
             // Alt+Left/Right are also natural word-motion keys in the composer. Keep agent
@@ -356,6 +360,22 @@ impl App {
             && !self.chat_widget.should_handle_vim_insert_escape(key_event)
     }
 
+    fn should_return_to_agents_dashboard(&self, key_event: KeyEvent) -> bool {
+        self.agents_dashboard
+            && self.overlay.is_none()
+            && self.chat_widget.no_modal_or_popup_active()
+            && self.chat_widget.composer_is_empty()
+            && self.chat_widget.composer_cursor_at_start()
+            && matches!(
+                key_event,
+                KeyEvent {
+                    code: KeyCode::Left,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }
+            )
+    }
+
     pub(super) fn reject_side_backtrack_esc(&mut self) {
         self.reset_backtrack_state();
         self.chat_widget
@@ -374,6 +394,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::super::test_support::make_test_app;
+    use crossterm::event::KeyCode;
+    use crossterm::event::KeyEvent;
 
     #[tokio::test]
     async fn app_keymap_shortcuts_are_disabled_while_keymap_view_is_active() {
@@ -384,5 +406,19 @@ mod tests {
         app.chat_widget.open_keymap_debug(&keymap);
 
         assert!(!app.app_keymap_shortcuts_available());
+    }
+
+    #[tokio::test]
+    async fn plain_left_returns_only_agents_sessions_with_an_unobstructed_empty_composer() {
+        let mut app = make_test_app().await;
+        let left = KeyEvent::from(KeyCode::Left);
+        assert!(!app.should_return_to_agents_dashboard(left));
+
+        app.agents_dashboard = true;
+        assert!(app.should_return_to_agents_dashboard(left));
+
+        let keymap = app.keymap.clone();
+        app.chat_widget.open_keymap_debug(&keymap);
+        assert!(!app.should_return_to_agents_dashboard(left));
     }
 }

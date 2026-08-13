@@ -1684,6 +1684,10 @@ impl ChatWidget {
         self.bottom_pane.composer_is_empty()
     }
 
+    pub(crate) fn composer_cursor_at_start(&self) -> bool {
+        self.bottom_pane.composer_cursor_at_start()
+    }
+
     #[cfg(test)]
     pub(crate) fn is_task_running_for_test(&self) -> bool {
         self.bottom_pane.is_task_running()

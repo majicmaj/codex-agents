@@ -123,8 +123,11 @@ class InstallShTest(unittest.TestCase):
             install_bin = root / "install-bin"
             current = root / "codex-home" / "packages" / "standalone" / "current"
             codex_path = install_bin / "codex"
+            agents_path = install_bin / "codex-agents"
             host_path = install_bin / "codex-code-mode-host"
             self.assertEqual(os.readlink(codex_path), str(current / "bin" / "codex"))
+            self.assertEqual(os.readlink(agents_path), str(current / "bin" / "codex"))
+            self.assertTrue(os.access(agents_path, os.X_OK))
             self.assertEqual(
                 os.readlink(host_path),
                 str(current / "bin" / "codex-code-mode-host"),

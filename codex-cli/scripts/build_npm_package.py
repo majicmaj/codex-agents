@@ -16,6 +16,7 @@ REPO_ROOT = CODEX_CLI_ROOT.parent
 RESPONSES_API_PROXY_NPM_ROOT = REPO_ROOT / "codex-rs" / "responses-api-proxy" / "npm"
 CODEX_SDK_ROOT = REPO_ROOT / "sdk" / "typescript"
 CODEX_NPM_NAME = "@openai/codex"
+AGENTS_NPM_NAME = "codex-agents"
 CODEX_PACKAGE_COMPONENT = "codex-package"
 
 # `npm_name` is the local optional-dependency alias consumed by `bin/codex.js`.
@@ -65,8 +66,20 @@ CODEX_PLATFORM_PACKAGES: dict[str, dict[str, str]] = {
     },
 }
 
+AGENTS_PLATFORM_PACKAGES: dict[str, dict[str, str]] = {
+    package_name.replace("codex-", "codex-agents-", 1): {
+        **package_config,
+        "npm_name": package_config["npm_name"].replace(
+            "@openai/codex-", "codex-agents-", 1
+        ),
+    }
+    for package_name, package_config in CODEX_PLATFORM_PACKAGES.items()
+}
+ALL_PLATFORM_PACKAGES = {**CODEX_PLATFORM_PACKAGES, **AGENTS_PLATFORM_PACKAGES}
+
 PACKAGE_EXPANSIONS: dict[str, list[str]] = {
     "codex": ["codex", *CODEX_PLATFORM_PACKAGES],
+    "codex-agents": ["codex-agents", *AGENTS_PLATFORM_PACKAGES],
 }
 
 PACKAGE_NATIVE_COMPONENTS: dict[str, list[str]] = {
@@ -77,13 +90,18 @@ PACKAGE_NATIVE_COMPONENTS: dict[str, list[str]] = {
     "codex-darwin-arm64": [CODEX_PACKAGE_COMPONENT],
     "codex-win32-x64": [CODEX_PACKAGE_COMPONENT],
     "codex-win32-arm64": [CODEX_PACKAGE_COMPONENT],
+    "codex-agents": [],
+    **{
+        package_name: [CODEX_PACKAGE_COMPONENT]
+        for package_name in AGENTS_PLATFORM_PACKAGES
+    },
     "codex-responses-api-proxy": ["codex-responses-api-proxy"],
     "codex-sdk": [],
 }
 
 PACKAGE_TARGET_FILTERS: dict[str, str] = {
     package_name: package_config["target_triple"]
-    for package_name, package_config in CODEX_PLATFORM_PACKAGES.items()
+    for package_name, package_config in ALL_PLATFORM_PACKAGES.items()
 }
 
 PACKAGE_CHOICES = tuple(PACKAGE_NATIVE_COMPONENTS)
@@ -174,7 +192,7 @@ def main() -> int:
 
         if release_version:
             staging_dir_str = str(staging_dir)
-            if package == "codex":
+            if package in {"codex", "codex-agents"}:
                 print(
                     f"Staged version {version} for release in {staging_dir_str}\n\n"
                     "Verify the CLI:\n"
@@ -187,7 +205,7 @@ def main() -> int:
                     "Verify the responses API proxy:\n"
                     f"    node {staging_dir_str}/bin/codex-responses-api-proxy.js --help\n\n"
                 )
-            elif package in CODEX_PLATFORM_PACKAGES:
+            elif package in ALL_PLATFORM_PACKAGES:
                 print(
                     f"Staged version {version} for release in {staging_dir_str}\n\n"
                     "Verify native payload contents:\n"
@@ -230,20 +248,33 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
     package_json: dict
     package_json_path: Path | None = None
 
-    if package == "codex":
+    if package in {"codex", "codex-agents"}:
         bin_dir = staging_dir / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(CODEX_CLI_ROOT / "bin" / "codex.js", bin_dir / "codex.js")
+        shutil.copy2(
+            CODEX_CLI_ROOT / "bin" / "codex-agents-update.js",
+            bin_dir / "codex-agents-update.js",
+        )
 
-        readme_src = REPO_ROOT / "README.md"
+        readme_src = (
+            CODEX_CLI_ROOT / "README.agents.md"
+            if package == "codex-agents"
+            else REPO_ROOT / "README.md"
+        )
         if readme_src.exists():
             shutil.copy2(readme_src, staging_dir / "README.md")
 
         package_json_path = CODEX_CLI_ROOT / "package.json"
-    elif package in CODEX_PLATFORM_PACKAGES:
-        platform_package = CODEX_PLATFORM_PACKAGES[package]
+    elif package in ALL_PLATFORM_PACKAGES:
+        platform_package = ALL_PLATFORM_PACKAGES[package]
         platform_npm_tag = platform_package["npm_tag"]
         platform_version = compute_platform_package_version(version, platform_npm_tag)
+        npm_name = (
+            AGENTS_NPM_NAME
+            if package in AGENTS_PLATFORM_PACKAGES
+            else CODEX_NPM_NAME
+        )
 
         readme_src = REPO_ROOT / "README.md"
         if readme_src.exists():
@@ -253,7 +284,7 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
             codex_package_json = json.load(fh)
 
         package_json = {
-            "name": CODEX_NPM_NAME,
+            "name": npm_name,
             "version": platform_version,
             "license": codex_package_json.get("license", "Apache-2.0"),
             "os": [platform_package["os"]],
@@ -292,7 +323,7 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
         package_json["version"] = version
 
     if package == "codex":
-        package_json["files"] = ["bin/codex.js"]
+        package_json["files"] = ["bin/codex.js", "bin/codex-agents-update.js"]
         package_json["optionalDependencies"] = {
             CODEX_PLATFORM_PACKAGES[platform_package]["npm_name"]: (
                 f"npm:{CODEX_NPM_NAME}@"
@@ -300,6 +331,23 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
             )
             for platform_package in PACKAGE_EXPANSIONS["codex"]
             if platform_package != "codex"
+        }
+    elif package == "codex-agents":
+        package_json["name"] = AGENTS_NPM_NAME
+        package_json["description"] = (
+            "A multi-session agents dashboard built on the OpenAI Codex CLI."
+        )
+        package_json["bin"] = {"codex-agents": "bin/codex.js"}
+        package_json["files"] = ["bin/codex.js", "bin/codex-agents-update.js"]
+        package_json["keywords"] = ["codex", "agents", "cli", "dashboard"]
+        package_json.pop("scripts", None)
+        package_json["optionalDependencies"] = {
+            AGENTS_PLATFORM_PACKAGES[platform_package]["npm_name"]: (
+                f"npm:{AGENTS_NPM_NAME}@"
+                f"{compute_platform_package_version(version, AGENTS_PLATFORM_PACKAGES[platform_package]['npm_tag'])}"
+            )
+            for platform_package in PACKAGE_EXPANSIONS["codex-agents"]
+            if platform_package != "codex-agents"
         }
 
     elif package == "codex-sdk":

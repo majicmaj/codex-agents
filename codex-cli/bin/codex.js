@@ -2,25 +2,38 @@
 // Unified entry point for the Codex CLI.
 
 import { spawn } from "node:child_process";
-import { existsSync, realpathSync } from "fs";
+import { existsSync, readFileSync, realpathSync } from "fs";
 import { createRequire } from "node:module";
 import path from "path";
 import { fileURLToPath } from "url";
+import { maybeAutoUpdate } from "./codex-agents-update.js";
 
 // __dirname equivalent in ESM
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const require = createRequire(import.meta.url);
 const codexPackageRoot = realpathSync(path.join(__dirname, ".."));
+const packageJson = JSON.parse(
+  readFileSync(path.join(codexPackageRoot, "package.json"), "utf8"),
+);
+const packageName = packageJson.name;
+const packageVersion = packageJson.version;
 
-const PLATFORM_PACKAGE_BY_TARGET = {
-  "x86_64-unknown-linux-musl": "@openai/codex-linux-x64",
-  "aarch64-unknown-linux-musl": "@openai/codex-linux-arm64",
-  "x86_64-apple-darwin": "@openai/codex-darwin-x64",
-  "aarch64-apple-darwin": "@openai/codex-darwin-arm64",
-  "x86_64-pc-windows-msvc": "@openai/codex-win32-x64",
-  "aarch64-pc-windows-msvc": "@openai/codex-win32-arm64",
-};
+const platformPackagePrefix =
+  packageName === "codex-agents" ? "codex-agents" : "@openai/codex";
+const PLATFORM_PACKAGE_BY_TARGET = Object.fromEntries(
+  Object.entries({
+    "x86_64-unknown-linux-musl": "linux-x64",
+    "aarch64-unknown-linux-musl": "linux-arm64",
+    "x86_64-apple-darwin": "darwin-x64",
+    "aarch64-apple-darwin": "darwin-arm64",
+    "x86_64-pc-windows-msvc": "win32-x64",
+    "aarch64-pc-windows-msvc": "win32-arm64",
+  }).map(([target, platform]) => [
+    target,
+    `${platformPackagePrefix}-${platform}`,
+  ]),
+);
 
 const { platform, arch } = process;
 
@@ -107,6 +120,32 @@ function findCodexExecutable() {
   );
 }
 
+const packageManager = detectPackageManager();
+const wasUpdated = await maybeAutoUpdate({
+  packageName,
+  currentVersion: packageVersion,
+  packageManager,
+});
+if (wasUpdated) {
+  const updatedEnv = {
+    ...process.env,
+    CODEX_AGENTS_SKIP_AUTO_UPDATE: "1",
+  };
+  const updated = spawn(process.argv[1], process.argv.slice(2), {
+    stdio: "inherit",
+    env: updatedEnv,
+  });
+  const updatedResult = await new Promise((resolve, reject) => {
+    updated.on("error", reject);
+    updated.on("exit", (code, signal) => resolve({ code, signal }));
+  });
+  if (updatedResult.signal) {
+    process.kill(process.pid, updatedResult.signal);
+  } else {
+    process.exit(updatedResult.code ?? 1);
+  }
+}
+
 const binaryPath = findCodexExecutable();
 
 // Use an asynchronous spawn instead of spawnSync so that Node is able to
@@ -176,7 +215,6 @@ function detectPackageManager() {
   return userAgent ? "npm" : null;
 }
 
-const packageManager = detectPackageManager();
 const packageManagerEnvVar =
   packageManager === "bun"
     ? "CODEX_MANAGED_BY_BUN"
@@ -187,12 +225,22 @@ const env = {
   ...process.env,
   CODEX_MANAGED_PACKAGE_ROOT: codexPackageRoot,
 };
+if (packageName === "codex-agents") {
+  env.CODEX_AGENTS_AUTO_UPDATE = "1";
+}
 delete env.CODEX_MANAGED_BY_NPM;
 delete env.CODEX_MANAGED_BY_BUN;
 delete env.CODEX_MANAGED_BY_PNPM;
 env[packageManagerEnvVar] = "1";
 
-const child = spawn(binaryPath, process.argv.slice(2), {
+const cliArgs = process.argv.slice(2);
+if (
+  path.basename(process.argv[1], path.extname(process.argv[1])) === "codex-agents"
+) {
+  cliArgs.unshift("agents");
+}
+
+const child = spawn(binaryPath, cliArgs, {
   stdio: "inherit",
   env,
 });

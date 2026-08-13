@@ -1,0 +1,10 @@
+---
+source: tui/src/resume_picker.rs
+expression: "render_dashboard_list_snapshot(&state, 72, 6)"
+---
+~/Projects/claudex  ─
+❯ [Needs Input] Recover disconnected daemon
+  Thread stopped because of a system error
+  42s ago        no branch
+
+↓ more
