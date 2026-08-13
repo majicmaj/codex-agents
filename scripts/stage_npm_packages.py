@@ -214,8 +214,11 @@ def install_from_workflow_artifacts(
     components: Sequence[str],
     vendor_dir: Path,
 ) -> None:
-    artifacts = select_target_artifacts(workflow_id, components)
-    download_artifacts(workflow_id, artifacts_dir, artifacts)
+    if local_artifacts_available(artifacts_dir, components):
+        print("Using native artifacts already present on disk", flush=True)
+    else:
+        artifacts = select_target_artifacts(workflow_id, components)
+        download_artifacts(workflow_id, artifacts_dir, artifacts)
     if CODEX_PACKAGE_COMPONENT in components:
         install_codex_package_archives(artifacts_dir, vendor_dir, BINARY_TARGETS)
     install_binary_components(
@@ -223,6 +226,23 @@ def install_from_workflow_artifacts(
         vendor_dir,
         [BINARY_COMPONENTS[name] for name in components if name in BINARY_COMPONENTS],
     )
+
+
+def local_artifacts_available(artifacts_dir: Path, components: Sequence[str]) -> bool:
+    for target in BINARY_TARGETS:
+        artifact_dir = artifact_dir_for_target(artifacts_dir, target)
+        if CODEX_PACKAGE_COMPONENT in components:
+            archive_path = artifact_dir / f"codex-package-{target}.tar.gz"
+            if not archive_path.is_file():
+                return False
+        for component_name in components:
+            component = BINARY_COMPONENTS.get(component_name)
+            if component is not None:
+                try:
+                    binary_archive_path(artifact_dir, component.artifact_prefix, target)
+                except FileNotFoundError:
+                    return False
+    return True
 
 
 def select_target_artifacts(

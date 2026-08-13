@@ -17,6 +17,11 @@ RESPONSES_API_PROXY_NPM_ROOT = REPO_ROOT / "codex-rs" / "responses-api-proxy" / 
 CODEX_SDK_ROOT = REPO_ROOT / "sdk" / "typescript"
 CODEX_NPM_NAME = "@openai/codex"
 AGENTS_NPM_NAME = "codex-agents"
+AGENTS_REPOSITORY = {
+    "type": "git",
+    "url": "git+https://github.com/majicmaj/codex-agents.git",
+    "directory": "codex-cli",
+}
 CODEX_PACKAGE_COMPONENT = "codex-package"
 
 # `npm_name` is the local optional-dependency alias consumed by `bin/codex.js`.
@@ -292,6 +297,8 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
             "files": ["vendor"],
             "repository": codex_package_json.get("repository"),
         }
+        if package in AGENTS_PLATFORM_PACKAGES:
+            package_json["repository"] = AGENTS_REPOSITORY
 
         engines = codex_package_json.get("engines")
         if isinstance(engines, dict):
@@ -340,6 +347,7 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
         package_json["bin"] = {"codex-agents": "bin/codex.js"}
         package_json["files"] = ["bin/codex.js", "bin/codex-agents-update.js"]
         package_json["keywords"] = ["codex", "agents", "cli", "dashboard"]
+        package_json["repository"] = AGENTS_REPOSITORY
         package_json.pop("scripts", None)
         package_json["optionalDependencies"] = {
             AGENTS_PLATFORM_PACKAGES[platform_package]["npm_name"]: (

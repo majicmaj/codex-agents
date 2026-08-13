@@ -1,0 +1,329 @@
+name: publish-codex-agents
+
+# One-time npm setup:
+# npm trust github codex-agents --file publish-codex-agents.yml \
+#   --repo majicmaj/codex-agents --env npm-release --allow-publish --yes
+
+on:
+  release:
+    types: [published]
+
+concurrency:
+  group: publish-codex-agents
+  cancel-in-progress: false
+
+jobs:
+  validate-release:
+    name: Validate release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      commit: ${{ steps.release.outputs.commit }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Validate stable release tag and commit
+        id: release
+        shell: bash
+        env:
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${IS_PRERELEASE}" == "true" ]]; then
+            echo "codex-agents npm releases must not be GitHub prereleases" >&2
+            exit 1
+          fi
+          if [[ ! "${RELEASE_TAG}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "Release tag must match vX.Y.Z; received ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+          version="${BASH_REMATCH[1]}"
+          commit="$(git rev-list -n 1 "${RELEASE_TAG}")"
+          git fetch origin main --no-tags
+          if ! git merge-base --is-ancestor "${commit}" origin/main; then
+            echo "Release commit ${commit} is not on main" >&2
+            exit 1
+          fi
+
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+  build-native:
+    name: Build ${{ matrix.target }}
+    needs: validate-release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: codex-rs
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/codex-rs/target
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: macos-15
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: windows-2025
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ needs.validate-release.outputs.commit }}
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Use hermetic Cargo home for musl
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_home="${GITHUB_WORKSPACE}/.cargo-home"
+          mkdir -p "${cargo_home}/bin"
+          echo "CARGO_HOME=${cargo_home}" >> "$GITHUB_ENV"
+          echo "${cargo_home}/bin" >> "$GITHUB_PATH"
+          : > "${cargo_home}/config.toml"
+
+      - name: Install Zig
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.0
+          use-cache: false
+
+      - name: Install musl build tools
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
+
+      - name: Disable aws-lc jitter entropy for musl
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          echo "AWS_LC_SYS_NO_JITTER_ENTROPY=1" >> "$GITHUB_ENV"
+          target_no_jitter="AWS_LC_SYS_NO_JITTER_ENTROPY_${TARGET}"
+          target_no_jitter="${target_no_jitter//-/_}"
+          echo "${target_no_jitter}=1" >> "$GITHUB_ENV"
+
+      - name: Configure MSVC
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/setup-msvc-env
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Configure rusty_v8 artifacts
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build bwrap and export digest
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo build --target "$TARGET" --release --bin bwrap
+          bwrap_path="target/${TARGET}/release/bwrap"
+          strip --strip-debug --strip-unneeded "$bwrap_path"
+          digest="$(sha256sum "$bwrap_path" | awk '{print $1}')"
+          echo "CODEX_BWRAP_SHA256=${digest}" >> "$GITHUB_ENV"
+
+      - name: Build Codex package binaries
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          build_args=(--bin codex --bin codex-code-mode-host)
+          if [[ "$TARGET" == *windows* ]]; then
+            build_args+=(--bin codex-command-runner --bin codex-windows-sandbox-setup)
+          fi
+          if [[ "$TARGET" == "x86_64-pc-windows-msvc" ]]; then
+            export LIBSQLITE3_FLAGS=SQLITE_DISABLE_INTRINSIC
+          fi
+          cargo build --target "$TARGET" --release "${build_args[@]}"
+
+      - name: Smoke-test native binary
+        if: runner.os != 'Windows' || matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [[ "$TARGET" == *windows* ]]; then
+            suffix=".exe"
+          fi
+          "target/${TARGET}/release/codex${suffix}" --version
+
+      - name: Build native package archive
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bash "${GITHUB_WORKSPACE}/.github/scripts/build-codex-package-archive.sh" \
+            --target "$TARGET" \
+            --bundle primary \
+            --entrypoint-dir "target/${TARGET}/release" \
+            --archive-dir "dist/${TARGET}"
+
+      - name: Upload native package archive
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: ${{ matrix.target }}
+          path: codex-rs/dist/${{ matrix.target }}/codex-package-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish-npm:
+    name: Publish npm packages
+    needs: [validate-release, build-native]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: npm-release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ needs.validate-release.outputs.commit }}
+
+      - name: Download native package archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: native-artifacts
+
+      - name: Setup Node.js for trusted publishing
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Test updater and local artifact staging
+        run: |
+          set -euo pipefail
+          node --test codex-cli/bin/codex-agents-update.test.js
+          python3 -m unittest scripts/stage_npm_packages_test.py
+
+      - name: Stage npm tarballs
+        env:
+          VERSION: ${{ needs.validate-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          ./scripts/stage_npm_packages.py \
+            --release-version "$VERSION" \
+            --package codex-agents \
+            --workflow-url local-artifacts \
+            --artifacts-dir native-artifacts \
+            --output-dir dist/npm
+
+      - name: Verify npm package manifests
+        env:
+          VERSION: ${{ needs.validate-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          expected=(
+            "codex-agents:${VERSION}"
+            "codex-agents:${VERSION}-linux-x64"
+            "codex-agents:${VERSION}-linux-arm64"
+            "codex-agents:${VERSION}-darwin-x64"
+            "codex-agents:${VERSION}-darwin-arm64"
+            "codex-agents:${VERSION}-win32-x64"
+            "codex-agents:${VERSION}-win32-arm64"
+          )
+          mapfile -t tarballs < <(find dist/npm -name '*.tgz' -type f | sort)
+          if [[ "${#tarballs[@]}" -ne "${#expected[@]}" ]]; then
+            echo "Expected ${#expected[@]} tarballs, found ${#tarballs[@]}" >&2
+            exit 1
+          fi
+          for package in "${expected[@]}"; do
+            name="${package%%:*}"
+            version="${package#*:}"
+            found=false
+            for tarball in "${tarballs[@]}"; do
+              if tar -xOf "$tarball" package/package.json \
+                | jq -e --arg name "$name" --arg version "$version" \
+                  'select(.name == $name and .version == $version)' >/dev/null; then
+                found=true
+                break
+              fi
+            done
+            if [[ "$found" != "true" ]]; then
+              echo "Missing ${name}@${version} from staged tarballs" >&2
+              exit 1
+            fi
+          done
+
+      - name: Publish platform packages, then root package
+        env:
+          VERSION: ${{ needs.validate-release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          publish_if_missing() {
+            local package_version="$1"
+            local npm_tag="$2"
+            local tarball="$3"
+            local package_name="codex-agents"
+            if npm view "${package_name}@${package_version}" version >/dev/null 2>&1; then
+              echo "${package_name}@${package_version} is already published"
+              return
+            fi
+            npm publish "$tarball" --access public --tag "$npm_tag"
+          }
+
+          publish_if_missing "${VERSION}-linux-x64" linux-x64 \
+            "dist/npm/codex-npm-agents-linux-x64-${VERSION}.tgz"
+          publish_if_missing "${VERSION}-linux-arm64" linux-arm64 \
+            "dist/npm/codex-npm-agents-linux-arm64-${VERSION}.tgz"
+          publish_if_missing "${VERSION}-darwin-x64" darwin-x64 \
+            "dist/npm/codex-npm-agents-darwin-x64-${VERSION}.tgz"
+          publish_if_missing "${VERSION}-darwin-arm64" darwin-arm64 \
+            "dist/npm/codex-npm-agents-darwin-arm64-${VERSION}.tgz"
+          publish_if_missing "${VERSION}-win32-x64" win32-x64 \
+            "dist/npm/codex-npm-agents-win32-x64-${VERSION}.tgz"
+          publish_if_missing "${VERSION}-win32-arm64" win32-arm64 \
+            "dist/npm/codex-npm-agents-win32-arm64-${VERSION}.tgz"
+          publish_if_missing "$VERSION" latest \
+            "dist/npm/codex-agents-npm-${VERSION}.tgz"
+
+      - name: Verify published version
+        env:
+          VERSION: ${{ needs.validate-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          published="$(npm view codex-agents version)"
+          if [[ "$published" != "$VERSION" ]]; then
+            echo "Expected codex-agents ${VERSION}, found ${published}" >&2
+            exit 1
+          fi
