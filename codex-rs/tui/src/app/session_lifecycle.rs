@@ -19,6 +19,12 @@ pub(super) enum ThreadAttachPresentation {
     PromptEdit,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ResumeCwdPolicy {
+    Configured,
+    Session,
+}
+
 /// Reports whether a loaded-thread backfill completed and which descendants already had their
 /// liveness metadata refreshed, allowing the picker to skip duplicate `thread/read` requests.
 #[derive(Default)]
@@ -913,6 +919,7 @@ impl App {
         tui: &mut tui::Tui,
         app_server: &mut AppServerSession,
         target_session: SessionTarget,
+        cwd_policy: ResumeCwdPolicy,
     ) -> Result<AppRunControl> {
         if self.ignore_same_thread_resume(&target_session) {
             tui.frame_requester().schedule_frame();
@@ -926,10 +933,13 @@ impl App {
             .cwd
             .as_deref()
             .or_else(|| app_server.remote_cwd_override());
-        let resume_cwd_mode = crate::session_resume::effective_resume_cwd_mode(
-            self.config.tui_resume_cwd,
-            cwd_override,
-        );
+        let resume_cwd_mode = match cwd_policy {
+            ResumeCwdPolicy::Configured => crate::session_resume::effective_resume_cwd_mode(
+                self.config.tui_resume_cwd,
+                cwd_override,
+            ),
+            ResumeCwdPolicy::Session => Some(ResumeCwdMode::Session),
+        };
         let remembered_current_cwd = cwd_override.unwrap_or(self.launch_cwd.as_path());
         let current_cwd = if matches!(resume_cwd_mode, Some(ResumeCwdMode::Current)) {
             remembered_current_cwd.to_path_buf()

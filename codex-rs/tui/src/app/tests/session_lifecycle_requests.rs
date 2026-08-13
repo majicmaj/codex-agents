@@ -1543,6 +1543,7 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                             path: Some(root_rollout_path),
                             thread_id: root_thread_id,
                         },
+                        super::super::session_lifecycle::ResumeCwdPolicy::Configured,
                     )
                     .await?;
 

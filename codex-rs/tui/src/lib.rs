@@ -821,7 +821,8 @@ async fn resolve_startup_resume_or_fork_cwd(
     uses_remote_workspace_or_environment: bool,
 ) -> color_eyre::Result<ResolveCwdOutcome> {
     let Some((action, target_session)) = (match session_selection {
-        resume_picker::SessionSelection::Resume(target_session) => {
+        resume_picker::SessionSelection::Resume(target_session)
+        | resume_picker::SessionSelection::ResumeInSessionCwd(target_session) => {
             Some((CwdPromptAction::Resume, target_session))
         }
         resume_picker::SessionSelection::Fork(target_session) => {
@@ -834,7 +835,14 @@ async fn resolve_startup_resume_or_fork_cwd(
     }) else {
         return Ok(ResolveCwdOutcome::Continue(None));
     };
-    let resume_cwd_mode = effective_resume_cwd_mode(config.tui_resume_cwd, cwd_override);
+    let resume_cwd_mode = if matches!(
+        session_selection,
+        resume_picker::SessionSelection::ResumeInSessionCwd(_)
+    ) {
+        Some(ResumeCwdMode::Session)
+    } else {
+        effective_resume_cwd_mode(config.tui_resume_cwd, cwd_override)
+    };
     if uses_remote_workspace_or_environment
         && cwd_override.is_none()
         && matches!(resume_cwd_mode, Some(ResumeCwdMode::Current))
@@ -1722,6 +1730,7 @@ async fn run_ratatui_app(
 
     let mut config = match &session_selection {
         resume_picker::SessionSelection::Resume(_)
+        | resume_picker::SessionSelection::ResumeInSessionCwd(_)
         | resume_picker::SessionSelection::Fork(_)
         | resume_picker::SessionSelection::StartFreshIn { .. } => {
             load_config_or_exit_with_fallback_cwd(
@@ -1826,6 +1835,7 @@ async fn run_ratatui_app(
         && matches!(
             &session_selection,
             resume_picker::SessionSelection::Resume(_)
+                | resume_picker::SessionSelection::ResumeInSessionCwd(_)
         );
     let bypass_hook_trust_for_startup_review = config.bypass_hook_trust && !is_persistent_resume;
     let hooks_request_handle = app_server.request_handle();
@@ -2467,6 +2477,62 @@ mod tests {
         .await?;
 
         assert_eq!(resolved, ResolveCwdOutcome::Continue(Some(selected_cwd)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_dashboard_resume_uses_session_cwd() -> color_eyre::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let codex_home = temp_dir.path().join("codex-home");
+        let launch_cwd = temp_dir.path().join("launch");
+        let session_cwd = temp_dir.path().join("session");
+        std::fs::create_dir_all(&codex_home)?;
+        std::fs::create_dir_all(&launch_cwd)?;
+        std::fs::create_dir_all(&session_cwd)?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "[tui]\nresume_cwd = \"current\"\n",
+        )?;
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.clone())
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+            .harness_overrides(ConfigOverrides {
+                cwd: Some(launch_cwd),
+                ..Default::default()
+            })
+            .build()
+            .await?;
+        let filename_timestamp = "2025-01-05T12-00-00";
+        let thread_id = write_session_rollout(
+            &codex_home,
+            filename_timestamp,
+            "2025-01-05T12:00:00Z",
+            "Saved user message",
+            &config.model_provider_id,
+            &session_cwd,
+        )?;
+        let target_session = resume_picker::SessionTarget {
+            path: Some(
+                codex_home
+                    .join("sessions/2025/01/05")
+                    .join(format!("rollout-{filename_timestamp}-{thread_id}.jsonl")),
+            ),
+            thread_id,
+        };
+        let mut tui = tui::test_support::make_test_tui()?;
+
+        let resolved = resolve_startup_resume_or_fork_cwd(
+            &mut tui,
+            &config,
+            /*state_db*/ None,
+            &resume_picker::SessionSelection::ResumeInSessionCwd(target_session),
+            /*cwd_override*/ None,
+            /*uses_remote_workspace*/ false,
+            /*uses_remote_workspace_or_environment*/ false,
+        )
+        .await?;
+
+        assert_eq!(resolved, ResolveCwdOutcome::Continue(Some(session_cwd)));
         Ok(())
     }
 

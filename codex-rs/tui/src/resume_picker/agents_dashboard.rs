@@ -159,6 +159,10 @@ impl PickerState {
             | InputResult::ParentOwnedInputBlocked
             | InputResult::None => {}
         }
+        if dashboard_composer.composer.is_in_paste_burst() {
+            self.requester
+                .schedule_frame_in(ChatComposer::recommended_paste_flush_delay());
+        }
         self.request_frame();
         true
     }

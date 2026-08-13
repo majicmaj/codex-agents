@@ -140,6 +140,7 @@ pub enum SessionSelection {
         user_message: crate::chatwidget::UserMessage,
     },
     Resume(SessionTarget),
+    ResumeInSessionCwd(SessionTarget),
     Fork(SessionTarget),
     Exit,
 }
@@ -709,6 +710,15 @@ async fn run_session_picker_with_loader(
                         state.handle_paste(pasted);
                     }
                     TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => {
+                        if let Some(dashboard) = state.dashboard_composer.as_mut() {
+                            if dashboard.composer.flush_paste_burst_if_due() {
+                                state.request_frame();
+                            } else if dashboard.composer.is_in_paste_burst() {
+                                state.requester.schedule_frame_in(
+                                    ChatComposer::recommended_paste_flush_delay(),
+                                );
+                            }
+                        }
                         let list_width = list_viewport_width(screen_size.width, &state);
                         let list_height = usize::from(
                             screen_size
@@ -1707,7 +1717,15 @@ impl PickerState {
                             self.request_unarchive(thread_id);
                             return Ok(None);
                         }
-                        return Ok(Some(self.action.selection(path, thread_id)));
+                        let selection = self.action.selection(path, thread_id);
+                        return Ok(Some(match selection {
+                            SessionSelection::Resume(target_session)
+                                if self.is_agents_dashboard() =>
+                            {
+                                SessionSelection::ResumeInSessionCwd(target_session)
+                            }
+                            selection => selection,
+                        }));
                     }
                     self.inline_error = Some(match path {
                         Some(path) => {
@@ -4782,6 +4800,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dashboard_paste_burst_flush_keeps_prompt_current_and_allows_submit() {
+        let mut state = dashboard_state(vec![make_dashboard_row(
+            "/work/selected",
+            "2026-04-28T16:20:00Z",
+            "selected session",
+            DashboardStatus::Idle,
+        )]);
+        state
+            .dashboard_composer
+            .as_mut()
+            .expect("dashboard composer")
+            .composer
+            .set_disable_paste_burst(false);
+
+        for character in ['1', '2', '3'] {
+            let selection = state
+                .handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .await
+                .expect("type dashboard prompt");
+            assert!(selection.is_none());
+        }
+
+        tokio::time::sleep(ChatComposer::recommended_paste_flush_delay()).await;
+        assert!(
+            state
+                .dashboard_composer
+                .as_mut()
+                .expect("dashboard composer")
+                .composer
+                .flush_paste_burst_if_due()
+        );
+        assert_eq!(
+            state
+                .dashboard_composer
+                .as_ref()
+                .expect("dashboard composer")
+                .composer
+                .current_text_with_pending(),
+            "123"
+        );
+        assert_snapshot!(
+            "agents_dashboard_composer_after_paste_burst_flush",
+            render_dashboard_snapshot(&state, /*width*/ 80, /*height*/ 20)
+        );
+
+        let selection = state
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .expect("submit dashboard prompt")
+            .expect("session selection");
+        let SessionSelection::StartFreshIn { cwd, user_message } = selection else {
+            panic!("expected selected-project fresh session");
+        };
+        assert_eq!(
+            (cwd, user_message),
+            (
+                PathBuf::from("/work/selected"),
+                crate::chatwidget::UserMessage {
+                    text: String::from("123"),
+                    local_images: Vec::new(),
+                    remote_image_urls: Vec::new(),
+                    text_elements: Vec::new(),
+                    mention_bindings: Vec::new(),
+                },
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn dashboard_empty_enter_resumes_selected_session() {
         let row = make_dashboard_row(
             "/work/selected",
@@ -4800,7 +4887,7 @@ mod tests {
 
         assert!(matches!(
             selection,
-            SessionSelection::Resume(SessionTarget {
+            SessionSelection::ResumeInSessionCwd(SessionTarget {
                 thread_id: selected_thread_id,
                 ..
             }) if selected_thread_id == thread_id
@@ -4826,7 +4913,7 @@ mod tests {
 
         assert!(matches!(
             selection,
-            SessionSelection::Resume(SessionTarget {
+            SessionSelection::ResumeInSessionCwd(SessionTarget {
                 thread_id: selected_thread_id,
                 ..
             }) if selected_thread_id == thread_id

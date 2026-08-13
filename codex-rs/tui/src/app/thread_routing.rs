@@ -1545,8 +1545,10 @@ impl App {
         initial_prompt: &Option<String>,
         initial_images: &[PathBuf],
     ) -> bool {
-        matches!(session_selection, SessionSelection::Resume(_))
-            && initial_prompt.is_none()
+        matches!(
+            session_selection,
+            SessionSelection::Resume(_) | SessionSelection::ResumeInSessionCwd(_)
+        ) && initial_prompt.is_none()
             && initial_images.is_empty()
     }
 

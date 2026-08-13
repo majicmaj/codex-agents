@@ -982,7 +982,8 @@ impl App {
                 chat_widget.set_queue_submissions_until_session_configured(/*queue*/ true);
                 (chat_widget, None)
             }
-            SessionSelection::Resume(target_session) => {
+            SessionSelection::Resume(target_session)
+            | SessionSelection::ResumeInSessionCwd(target_session) => {
                 let model_settings = config_persistence::resume_model_settings_for_overrides(
                     &config,
                     &harness_overrides,

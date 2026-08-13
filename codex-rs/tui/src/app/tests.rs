@@ -6116,6 +6116,7 @@ async fn remote_resume_current_cwd_rejection_snapshot() -> Result<()> {
                 path: None,
                 thread_id: ThreadId::new(),
             },
+            super::session_lifecycle::ResumeCwdPolicy::Configured,
         )
         .await?;
 
@@ -6158,6 +6159,7 @@ async fn remote_exec_resume_current_cwd_is_rejected() -> Result<()> {
                 path: None,
                 thread_id: ThreadId::new(),
             },
+            super::session_lifecycle::ResumeCwdPolicy::Configured,
         )
         .await?;
 
@@ -6195,6 +6197,7 @@ async fn in_app_resume_session_cwd_without_metadata_is_non_fatal() -> Result<()>
                 path: None,
                 thread_id: ThreadId::new(),
             },
+            super::session_lifecycle::ResumeCwdPolicy::Configured,
         )
         .await?;
 
@@ -6257,6 +6260,7 @@ async fn remote_resume_keeps_server_only_cwd_out_of_local_config() -> Result<()>
                 path: Some(rollout_path),
                 thread_id: ThreadId::from_string(&thread_id)?,
             },
+            super::session_lifecycle::ResumeCwdPolicy::Configured,
         )
         .await?;
 
@@ -6375,6 +6379,7 @@ async fn in_app_resume_uses_configured_or_explicit_cwd() -> Result<()> {
                     path: Some(rollout_path),
                     thread_id,
                 },
+                super::session_lifecycle::ResumeCwdPolicy::Configured,
             )
             .await?;
 
@@ -6508,7 +6513,12 @@ async fn remembered_current_cwd_stays_at_launch_across_in_app_resumes() -> Resul
 
     for target_session in targets {
         let control = app
-            .resume_target_session(&mut tui, &mut app_server, target_session)
+            .resume_target_session(
+                &mut tui,
+                &mut app_server,
+                target_session,
+                super::session_lifecycle::ResumeCwdPolicy::Configured,
+            )
             .await?;
 
         assert!(matches!(control, AppRunControl::Continue));

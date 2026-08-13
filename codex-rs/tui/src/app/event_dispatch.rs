@@ -177,7 +177,28 @@ impl App {
                     }
                     SessionSelection::Resume(target_session) => {
                         match self
-                            .resume_target_session(tui, app_server, target_session)
+                            .resume_target_session(
+                                tui,
+                                app_server,
+                                target_session,
+                                super::session_lifecycle::ResumeCwdPolicy::Configured,
+                            )
+                            .await?
+                        {
+                            AppRunControl::Continue => {}
+                            AppRunControl::Exit(reason) => {
+                                return Ok(AppRunControl::Exit(reason));
+                            }
+                        }
+                    }
+                    SessionSelection::ResumeInSessionCwd(target_session) => {
+                        match self
+                            .resume_target_session(
+                                tui,
+                                app_server,
+                                target_session,
+                                super::session_lifecycle::ResumeCwdPolicy::Session,
+                            )
                             .await?
                         {
                             AppRunControl::Continue => {}
@@ -265,7 +286,12 @@ impl App {
                 {
                     Some(target_session) => {
                         return self
-                            .resume_target_session(tui, app_server, target_session)
+                            .resume_target_session(
+                                tui,
+                                app_server,
+                                target_session,
+                                super::session_lifecycle::ResumeCwdPolicy::Configured,
+                            )
                             .await;
                     }
                     None => {

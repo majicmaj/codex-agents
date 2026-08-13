@@ -1,0 +1,24 @@
+---
+source: tui/src/resume_picker.rs
+expression: "render_dashboard_snapshot(&state, 80, 20)"
+---
+ Codex Agents
+
+ Ctrl+F search sessions                                        Group: [project]
+
+ /work/selected  ─
+ ❯ [Idle]        selected session
+   10m ago        no branch
+
+ /work/invocation  ─
+                 Start a new agent
+   -              no branch
+
+
+
+
+
+
+› 123
+
+   enter start agent    ctrl+g group    ctrl+↑/↓ select project
