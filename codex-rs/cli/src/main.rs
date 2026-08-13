@@ -1326,14 +1326,14 @@ async fn cli_main(
 
             #[cfg(unix)]
             {
-                codex_app_server_daemon::bootstrap(AppServerBootstrapOptions {
+                codex_app_server_daemon::bootstrap_for_agents(AppServerBootstrapOptions {
                     remote_control_enabled: false,
                 })
                 .await
                 .map_err(|err| {
                     anyhow::anyhow!(
                         "failed to start the shared Codex app-server daemon: {err:#}\n\
-                         Install or update the standalone Codex CLI, then retry `codex agents`."
+                         Reinstall or update Codex, then retry `codex agents`."
                     )
                 })?;
 

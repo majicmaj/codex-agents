@@ -33,6 +33,7 @@ const UPDATE_PID_FILE_NAME: &str = "app-server-updater.pid";
 const OPERATION_LOCK_FILE_NAME: &str = "daemon.lock";
 const SETTINGS_FILE_NAME: &str = "settings.json";
 const STATE_DIR_NAME: &str = "app-server-daemon";
+const CODEX_AGENTS_AUTO_UPDATE_ENV_VAR: &str = "CODEX_AGENTS_AUTO_UPDATE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleCommand {
@@ -195,7 +196,24 @@ pub async fn run(command: LifecycleCommand) -> Result<LifecycleOutput> {
 
 pub async fn bootstrap(options: BootstrapOptions) -> Result<BootstrapOutput> {
     ensure_supported_platform()?;
-    Daemon::from_environment()?.bootstrap(options).await
+    Daemon::from_environment()?
+        .bootstrap(options, BootstrapSource::ManagedStandalone)
+        .await
+}
+
+/// Bootstraps the agents dashboard daemon using the update mechanism for the
+/// Codex distribution that launched it.
+pub async fn bootstrap_for_agents(options: BootstrapOptions) -> Result<BootstrapOutput> {
+    if std::env::var_os(CODEX_AGENTS_AUTO_UPDATE_ENV_VAR).is_some() {
+        ensure_supported_platform()?;
+        let codex_bin =
+            std::env::current_exe().context("failed to resolve current Codex executable")?;
+        Daemon::from_environment()?
+            .bootstrap(options, BootstrapSource::PackageManaged(codex_bin))
+            .await
+    } else {
+        bootstrap(options).await
+    }
 }
 
 pub async fn ensure_remote_control_ready() -> Result<RemoteControlReadyOutput> {
@@ -257,6 +275,11 @@ struct Daemon {
     operation_lock_file: PathBuf,
     settings_file: PathBuf,
     managed_codex_bin: PathBuf,
+}
+
+enum BootstrapSource {
+    ManagedStandalone,
+    PackageManaged(PathBuf),
 }
 
 impl Daemon {
@@ -449,6 +472,11 @@ impl Daemon {
     }
 
     async fn wait_until_ready(&self) -> Result<client::ProbeInfo> {
+        self.wait_until_ready_with_bin(&self.managed_codex_bin)
+            .await
+    }
+
+    async fn wait_until_ready_with_bin(&self, codex_bin: &Path) -> Result<client::ProbeInfo> {
         let deadline = tokio::time::Instant::now() + START_TIMEOUT;
         loop {
             match client::probe(&self.socket_path).await {
@@ -458,37 +486,42 @@ impl Daemon {
                     sleep(START_POLL_INTERVAL).await;
                 }
                 Err(err) => {
-                    let context = self.app_server_not_ready_context().await;
+                    let context = self.app_server_not_ready_context_with_bin(codex_bin).await;
                     return Err(err).context(context);
                 }
             }
         }
     }
 
-    async fn app_server_not_ready_context(&self) -> String {
+    async fn app_server_not_ready_context_with_bin(&self, codex_bin: &Path) -> String {
         let mut context = format!(
             "app server did not become ready on {}",
             self.socket_path.display()
         );
-        self.append_daemon_app_server_context(&mut context).await;
+        self.append_daemon_app_server_context(&mut context, codex_bin)
+            .await;
         backend::append_stderr_log_tail_context(&self.pid_file, &mut context).await;
         context
     }
 
-    async fn append_daemon_app_server_context(&self, context: &mut String) {
-        let managed_codex_version = self
-            .managed_codex_version_best_effort()
+    async fn append_daemon_app_server_context(&self, context: &mut String, codex_bin: &Path) {
+        let codex_version = self
+            .codex_version_best_effort(codex_bin)
             .await
             .unwrap_or_else(|| "unknown".to_string());
         context.push_str(&format!(
-            "\n\nDaemon used app-server:\n  path: {}\n  version: {managed_codex_version}",
-            self.managed_codex_bin.display()
+            "\n\nDaemon used app-server:\n  path: {}\n  version: {codex_version}",
+            codex_bin.display()
         ));
     }
 
-    async fn bootstrap(&self, options: BootstrapOptions) -> Result<BootstrapOutput> {
+    async fn bootstrap(
+        &self,
+        options: BootstrapOptions,
+        source: BootstrapSource,
+    ) -> Result<BootstrapOutput> {
         let _operation_lock = self.acquire_operation_lock().await?;
-        self.bootstrap_locked(options).await
+        self.bootstrap_locked(options, source).await
     }
 
     async fn ensure_remote_control_started(&self) -> Result<RemoteControlStartOutput> {
@@ -503,9 +536,12 @@ impl Daemon {
         }
 
         let output = self
-            .bootstrap_locked(BootstrapOptions {
-                remote_control_enabled: true,
-            })
+            .bootstrap_locked(
+                BootstrapOptions {
+                    remote_control_enabled: true,
+                },
+                BootstrapSource::ManagedStandalone,
+            )
             .await?;
         Ok(RemoteControlStartOutput::Bootstrap(output))
     }
@@ -584,8 +620,26 @@ impl Daemon {
         ))
     }
 
-    async fn bootstrap_locked(&self, options: BootstrapOptions) -> Result<BootstrapOutput> {
-        self.ensure_managed_codex_bin()?;
+    async fn bootstrap_locked(
+        &self,
+        options: BootstrapOptions,
+        source: BootstrapSource,
+    ) -> Result<BootstrapOutput> {
+        let (codex_bin, auto_update_enabled) = match &source {
+            BootstrapSource::ManagedStandalone => {
+                self.ensure_managed_codex_bin()?;
+                (&self.managed_codex_bin, true)
+            }
+            BootstrapSource::PackageManaged(codex_bin) => {
+                if !codex_bin.is_file() {
+                    return Err(anyhow!(
+                        "package-managed Codex executable not found at {}",
+                        codex_bin.display()
+                    ));
+                }
+                (codex_bin, false)
+            }
+        };
 
         let settings = DaemonSettings {
             remote_control_enabled: options.remote_control_enabled,
@@ -603,22 +657,24 @@ impl Daemon {
             backend.stop().await?;
         }
 
-        let backend = backend::pid_backend(self.backend_paths(&settings));
+        let backend = backend::pid_backend(self.backend_paths_with_bin(&settings, codex_bin));
         backend.start().await?;
         let updater = backend::pid_update_loop_backend(self.backend_paths(&settings));
         if updater.is_starting_or_running().await? {
             updater.stop().await?;
         }
-        updater.start().await?;
+        if auto_update_enabled {
+            updater.start().await?;
+        }
 
-        let info = self.wait_until_ready().await?;
-        let managed_codex_version = self.managed_codex_version_best_effort().await;
+        let info = self.wait_until_ready_with_bin(codex_bin).await?;
+        let managed_codex_version = self.codex_version_best_effort(codex_bin).await;
         Ok(BootstrapOutput {
             status: BootstrapStatus::Bootstrapped,
             backend: BackendKind::Pid,
-            auto_update_enabled: true,
+            auto_update_enabled,
             remote_control_enabled: settings.remote_control_enabled,
-            managed_codex_path: self.managed_codex_bin.clone(),
+            managed_codex_path: codex_bin.to_path_buf(),
             managed_codex_version,
             socket_path: self.socket_path.clone(),
             cli_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -681,11 +737,22 @@ impl Daemon {
 
     #[cfg(unix)]
     async fn managed_codex_version_best_effort(&self) -> Option<String> {
-        managed_codex_version(&self.managed_codex_bin).await.ok()
+        self.codex_version_best_effort(&self.managed_codex_bin)
+            .await
     }
 
     #[cfg(not(unix))]
     async fn managed_codex_version_best_effort(&self) -> Option<String> {
+        None
+    }
+
+    #[cfg(unix)]
+    async fn codex_version_best_effort(&self, codex_bin: &Path) -> Option<String> {
+        managed_codex_version(codex_bin).await.ok()
+    }
+
+    #[cfg(not(unix))]
+    async fn codex_version_best_effort(&self, _codex_bin: &Path) -> Option<String> {
         None
     }
 
@@ -1023,7 +1090,9 @@ mod tests {
             .expect("write stderr log");
 
         assert_eq!(
-            daemon.app_server_not_ready_context().await,
+            daemon
+                .app_server_not_ready_context_with_bin(&daemon.managed_codex_bin)
+                .await,
             format!(
                 "app server did not become ready on {}\n\n\
                  Daemon used app-server:\n  path: {}\n  version: unknown\n\n\

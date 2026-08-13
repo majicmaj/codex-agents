@@ -544,7 +544,7 @@ pub(crate) async fn reconnect_app_server_for_dashboard(
                 last_error = Some(err);
                 #[cfg(unix)]
                 if matches!(target, AppServerTarget::LocalDaemon { .. })
-                    && let Err(err) = codex_app_server_daemon::bootstrap(
+                    && let Err(err) = codex_app_server_daemon::bootstrap_for_agents(
                         codex_app_server_daemon::BootstrapOptions {
                             remote_control_enabled: false,
                         },
