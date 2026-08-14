@@ -97,6 +97,16 @@ impl PickerState {
             self.request_frame();
             return;
         }
+        if self
+            .filtered_rows
+            .get(self.selected)
+            .and_then(|row| row.thread_id)
+            != Some(thread_id)
+        {
+            self.archive_state = ArchiveState::Idle;
+            self.request_frame();
+            return;
+        }
 
         self.archive_state = ArchiveState::Pending { thread_id };
         self.request_frame();

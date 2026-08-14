@@ -1696,7 +1696,10 @@ impl PickerState {
                 self.toggle_density().await;
             }
             _ if self.list_keymap.accept.is_pressed(key)
-                && !matches!(self.archive_state, archive::ArchiveState::Idle) => {}
+                && matches!(
+                    self.archive_state,
+                    archive::ArchiveState::Pending { .. } | archive::ArchiveState::Restoring { .. }
+                ) => {}
             _ if self.list_keymap.accept.is_pressed(key) => {
                 if self.handle_dashboard_command() {
                     return Ok(None);
@@ -1821,16 +1824,7 @@ impl PickerState {
                 new_query.pop();
                 self.set_query(new_query);
             }
-            _ if crate::key_hint::ctrl(KeyCode::Char('x')).is_press(key)
-                || matches!(
-                    key,
-                    KeyEvent {
-                        code: KeyCode::Char('\u{0018}'),
-                        modifiers: KeyModifiers::NONE,
-                        ..
-                    }
-                ) =>
-            {
+            _ if crate::key_hint::ctrl(KeyCode::Char('x')).is_press(key) => {
                 if self.archive_confirmation_pending() {
                     self.confirm_archive();
                 } else if self.archive_shortcut_available() {

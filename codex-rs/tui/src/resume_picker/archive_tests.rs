@@ -17,6 +17,7 @@ use codex_app_server_protocol::ThreadSortKey;
 use codex_protocol::ThreadId;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
+use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use pretty_assertions::assert_eq;
 use std::path::PathBuf;
@@ -117,6 +118,76 @@ fn archive_confirmation_expires_after_three_seconds() {
     state.expire_archive_confirmation();
 
     assert_eq!(state.archive_state, ArchiveState::Idle);
+}
+
+#[test]
+fn archive_confirmation_cancels_when_selection_changes() {
+    let (mut state, requests) = archive_picker_state();
+    let first_thread_id = ThreadId::new();
+    set_selected_session(&mut state, first_thread_id);
+    let second_thread_id = ThreadId::new();
+    state.all_rows.push(Row {
+        path: None,
+        preview: String::from("Another session"),
+        thread_id: Some(second_thread_id),
+        thread_name: None,
+        created_at: None,
+        updated_at: None,
+        cwd: None,
+        git_branch: None,
+        dashboard_status: None,
+    });
+    state.apply_filter();
+
+    state.request_archive_for_selected_session();
+    state.selected = 1;
+    state.confirm_archive();
+
+    assert_eq!(state.archive_state, ArchiveState::Idle);
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn archive_confirmation_does_not_block_resuming() {
+    let (mut state, requests) = archive_picker_state();
+    let thread_id = ThreadId::new();
+    set_selected_session(&mut state, thread_id);
+    state.request_archive_for_selected_session();
+
+    let selection = state
+        .handle_key(KeyEvent::from(KeyCode::Enter))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        selection,
+        Some(SessionSelection::Resume(SessionTarget {
+            path: None,
+            thread_id: selected_thread_id,
+        })) if selected_thread_id == thread_id
+    ));
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn archive_shortcut_ignores_release_events() {
+    let (mut state, requests) = archive_picker_state();
+    set_selected_session(&mut state, ThreadId::new());
+
+    assert!(
+        state
+            .handle_key(KeyEvent::new_with_kind(
+                KeyCode::Char('\u{0018}'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    assert_eq!(state.archive_state, ArchiveState::Idle);
+    assert!(requests.lock().unwrap().is_empty());
 }
 
 #[test]
