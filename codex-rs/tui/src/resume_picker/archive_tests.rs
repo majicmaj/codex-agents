@@ -144,6 +144,12 @@ fn archive_failure_preserves_session_and_reports_server_error() {
     let thread_id = ThreadId::new();
     set_selected_session(&mut state, thread_id);
     state.request_archive_for_selected_session();
+    assert!(matches!(
+        state.archive_state,
+        ArchiveState::Confirming { thread_id: confirming_thread_id, .. } if confirming_thread_id == thread_id
+    ));
+    assert!(requests.lock().unwrap().is_empty());
+    state.confirm_archive();
     let error = TypedRequestError::Server {
         method: String::from("thread/archive"),
         source: JSONRPCErrorError {
@@ -165,6 +171,7 @@ fn archive_failure_preserves_session_and_reports_server_error() {
     assert_eq!(state.filtered_rows.len(), 1);
 
     state.request_archive_for_selected_session();
+    state.confirm_archive();
 
     assert_eq!(*requests.lock().unwrap(), vec![thread_id, thread_id]);
 }
