@@ -67,9 +67,19 @@ async fn archive_shortcut_archives_selected_session_once() {
     let (mut state, requests) = archive_picker_state();
     let thread_id = ThreadId::new();
     set_selected_session(&mut state, thread_id);
-    let shortcut = KeyEvent::new(KeyCode::Char('\u{0001}'), KeyModifiers::NONE);
+    let shortcut = KeyEvent::new(KeyCode::Char('\u{0018}'), KeyModifiers::NONE);
 
     assert!(state.handle_key(shortcut).await.unwrap().is_none());
+    assert!(state.archive_confirmation_pending());
+    let footer = super::super::footer_hint_lines(&state, /*width*/ 220)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!(footer, @r"
+     [Archive?] press ctrl+x again to archive
+
+    ");
     assert!(state.handle_key(shortcut).await.unwrap().is_none());
     assert_eq!(state.archive_state, ArchiveState::Pending { thread_id });
     assert_eq!(*requests.lock().unwrap(), vec![thread_id]);
@@ -85,6 +95,28 @@ async fn archive_shortcut_archives_selected_session_once() {
 
     assert_eq!(state.archive_state, ArchiveState::Idle);
     assert!(state.filtered_rows.is_empty());
+}
+
+#[test]
+fn archive_confirmation_expires_after_three_seconds() {
+    let (mut state, _requests) = archive_picker_state();
+    set_selected_session(&mut state, ThreadId::new());
+    state.request_archive_for_selected_session();
+    let ArchiveState::Confirming {
+        thread_id,
+        expires_at,
+    } = state.archive_state
+    else {
+        panic!("archive confirmation should be pending");
+    };
+
+    state.archive_state = ArchiveState::Confirming {
+        thread_id,
+        expires_at: expires_at - std::time::Duration::from_secs(4),
+    };
+    state.expire_archive_confirmation();
+
+    assert_eq!(state.archive_state, ArchiveState::Idle);
 }
 
 #[test]
@@ -141,7 +173,7 @@ fn archive_failure_preserves_session_and_reports_server_error() {
 fn archive_shortcut_preserves_configured_list_binding() {
     let (mut state, _requests) = archive_picker_state();
     state.list_keymap.move_up.push(KeyBinding::new(
-        KeyCode::Char('\u{0001}'),
+        KeyCode::Char('\u{0018}'),
         KeyModifiers::NONE,
     ));
 
@@ -159,7 +191,7 @@ fn archive_footer_shows_shortcut_for_resume_sessions() {
         .join("\n");
 
     insta::assert_snapshot!(footer, @r"
-     enter resume   ctrl+a archive   esc start new   ctrl+c quit   tab focus sort/filter   ←/→ change option
+     enter resume   ctrl+x archive   esc start new   ctrl+c quit   tab focus sort/filter   ←/→ change option
      ctrl+o dense view   ctrl+t transcript   ctrl+e expand   ↑/↓ browse
     ");
 }

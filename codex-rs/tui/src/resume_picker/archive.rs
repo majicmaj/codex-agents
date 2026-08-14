@@ -2,6 +2,8 @@ use codex_protocol::ThreadId;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
+use std::time::Duration;
+use std::time::Instant;
 
 use super::LoadTrigger;
 use super::PickerLoadRequest;
@@ -19,6 +21,10 @@ use crate::keymap::KeymapContext;
 pub(super) enum ArchiveState {
     #[default]
     Idle,
+    Confirming {
+        thread_id: ThreadId,
+        expires_at: Instant,
+    },
     Pending {
         thread_id: ThreadId,
     },
@@ -35,7 +41,7 @@ impl PickerState {
             return false;
         }
 
-        let archive_key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        let archive_key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
         self.list_keymap.action_for(archive_key).is_none()
             && !self.chord_keymap.bindings.iter().any(|binding| {
                 binding.action.context == KeymapContext::List
@@ -70,9 +76,44 @@ impl PickerState {
             return;
         }
 
+        self.archive_state = ArchiveState::Confirming {
+            thread_id,
+            expires_at: Instant::now() + Duration::from_secs(3),
+        };
+        self.requester.schedule_frame_in(Duration::from_secs(3));
+        self.request_frame();
+    }
+
+    pub(super) fn confirm_archive(&mut self) {
+        let ArchiveState::Confirming {
+            thread_id,
+            expires_at,
+        } = self.archive_state
+        else {
+            return;
+        };
+        if Instant::now() >= expires_at {
+            self.archive_state = ArchiveState::Idle;
+            self.request_frame();
+            return;
+        }
+
         self.archive_state = ArchiveState::Pending { thread_id };
         self.request_frame();
         (self.picker_loader)(PickerLoadRequest::Archive { thread_id });
+    }
+
+    pub(super) fn expire_archive_confirmation(&mut self) {
+        if matches!(
+            self.archive_state,
+            ArchiveState::Confirming { expires_at, .. } if Instant::now() >= expires_at
+        ) {
+            self.archive_state = ArchiveState::Idle;
+        }
+    }
+
+    pub(super) fn archive_confirmation_pending(&self) -> bool {
+        matches!(self.archive_state, ArchiveState::Confirming { .. })
     }
 
     pub(super) fn handle_archive_result(
