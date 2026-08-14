@@ -17,6 +17,7 @@ use codex_app_server_protocol::ThreadSortKey;
 use codex_protocol::ThreadId;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
+use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use pretty_assertions::assert_eq;
 use std::path::PathBuf;
@@ -67,9 +68,19 @@ async fn archive_shortcut_archives_selected_session_once() {
     let (mut state, requests) = archive_picker_state();
     let thread_id = ThreadId::new();
     set_selected_session(&mut state, thread_id);
-    let shortcut = KeyEvent::new(KeyCode::Char('\u{0001}'), KeyModifiers::NONE);
+    let shortcut = KeyEvent::new(KeyCode::Char('\u{0018}'), KeyModifiers::NONE);
 
     assert!(state.handle_key(shortcut).await.unwrap().is_none());
+    assert!(state.archive_confirmation_pending());
+    let footer = super::super::footer_hint_lines(&state, /*width*/ 220)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!(footer, @r"
+     [Archive?] press ctrl+x again to archive
+
+    ");
     assert!(state.handle_key(shortcut).await.unwrap().is_none());
     assert_eq!(state.archive_state, ArchiveState::Pending { thread_id });
     assert_eq!(*requests.lock().unwrap(), vec![thread_id]);
@@ -85,6 +96,98 @@ async fn archive_shortcut_archives_selected_session_once() {
 
     assert_eq!(state.archive_state, ArchiveState::Idle);
     assert!(state.filtered_rows.is_empty());
+}
+
+#[test]
+fn archive_confirmation_expires_after_three_seconds() {
+    let (mut state, _requests) = archive_picker_state();
+    set_selected_session(&mut state, ThreadId::new());
+    state.request_archive_for_selected_session();
+    let ArchiveState::Confirming {
+        thread_id,
+        expires_at,
+    } = state.archive_state
+    else {
+        panic!("archive confirmation should be pending");
+    };
+
+    state.archive_state = ArchiveState::Confirming {
+        thread_id,
+        expires_at: expires_at - std::time::Duration::from_secs(4),
+    };
+    state.expire_archive_confirmation();
+
+    assert_eq!(state.archive_state, ArchiveState::Idle);
+}
+
+#[test]
+fn archive_confirmation_cancels_when_selection_changes() {
+    let (mut state, requests) = archive_picker_state();
+    let first_thread_id = ThreadId::new();
+    set_selected_session(&mut state, first_thread_id);
+    let second_thread_id = ThreadId::new();
+    state.all_rows.push(Row {
+        path: None,
+        preview: String::from("Another session"),
+        thread_id: Some(second_thread_id),
+        thread_name: None,
+        created_at: None,
+        updated_at: None,
+        cwd: None,
+        git_branch: None,
+        dashboard_status: None,
+    });
+    state.apply_filter();
+
+    state.request_archive_for_selected_session();
+    state.selected = 1;
+    state.confirm_archive();
+
+    assert_eq!(state.archive_state, ArchiveState::Idle);
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn archive_confirmation_does_not_block_resuming() {
+    let (mut state, requests) = archive_picker_state();
+    let thread_id = ThreadId::new();
+    set_selected_session(&mut state, thread_id);
+    state.request_archive_for_selected_session();
+
+    let selection = state
+        .handle_key(KeyEvent::from(KeyCode::Enter))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        selection,
+        Some(SessionSelection::Resume(SessionTarget {
+            path: None,
+            thread_id: selected_thread_id,
+        })) if selected_thread_id == thread_id
+    ));
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn archive_shortcut_ignores_release_events() {
+    let (mut state, requests) = archive_picker_state();
+    set_selected_session(&mut state, ThreadId::new());
+
+    assert!(
+        state
+            .handle_key(KeyEvent::new_with_kind(
+                KeyCode::Char('\u{0018}'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    assert_eq!(state.archive_state, ArchiveState::Idle);
+    assert!(requests.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -112,6 +215,12 @@ fn archive_failure_preserves_session_and_reports_server_error() {
     let thread_id = ThreadId::new();
     set_selected_session(&mut state, thread_id);
     state.request_archive_for_selected_session();
+    assert!(matches!(
+        state.archive_state,
+        ArchiveState::Confirming { thread_id: confirming_thread_id, .. } if confirming_thread_id == thread_id
+    ));
+    assert!(requests.lock().unwrap().is_empty());
+    state.confirm_archive();
     let error = TypedRequestError::Server {
         method: String::from("thread/archive"),
         source: JSONRPCErrorError {
@@ -133,6 +242,7 @@ fn archive_failure_preserves_session_and_reports_server_error() {
     assert_eq!(state.filtered_rows.len(), 1);
 
     state.request_archive_for_selected_session();
+    state.confirm_archive();
 
     assert_eq!(*requests.lock().unwrap(), vec![thread_id, thread_id]);
 }
@@ -141,7 +251,7 @@ fn archive_failure_preserves_session_and_reports_server_error() {
 fn archive_shortcut_preserves_configured_list_binding() {
     let (mut state, _requests) = archive_picker_state();
     state.list_keymap.move_up.push(KeyBinding::new(
-        KeyCode::Char('\u{0001}'),
+        KeyCode::Char('\u{0018}'),
         KeyModifiers::NONE,
     ));
 
@@ -159,7 +269,7 @@ fn archive_footer_shows_shortcut_for_resume_sessions() {
         .join("\n");
 
     insta::assert_snapshot!(footer, @r"
-     enter resume   ctrl+a archive   esc start new   ctrl+c quit   tab focus sort/filter   ←/→ change option
+     enter resume   ctrl+x archive   esc start new   ctrl+c quit   tab focus sort/filter   ←/→ change option
      ctrl+o dense view   ctrl+t transcript   ctrl+e expand   ↑/↓ browse
     ");
 }

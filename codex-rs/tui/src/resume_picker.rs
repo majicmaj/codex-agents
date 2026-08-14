@@ -710,6 +710,7 @@ async fn run_session_picker_with_loader(
                         state.handle_paste(pasted);
                     }
                     TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => {
+                        state.expire_archive_confirmation();
                         if let Some(dashboard) = state.dashboard_composer.as_mut() {
                             if dashboard.composer.flush_paste_burst_if_due() {
                                 state.request_frame();
@@ -1695,7 +1696,10 @@ impl PickerState {
                 self.toggle_density().await;
             }
             _ if self.list_keymap.accept.is_pressed(key)
-                && !matches!(self.archive_state, archive::ArchiveState::Idle) => {}
+                && matches!(
+                    self.archive_state,
+                    archive::ArchiveState::Pending { .. } | archive::ArchiveState::Restoring { .. }
+                ) => {}
             _ if self.list_keymap.accept.is_pressed(key) => {
                 if self.handle_dashboard_command() {
                     return Ok(None);
@@ -1820,10 +1824,12 @@ impl PickerState {
                 new_query.pop();
                 self.set_query(new_query);
             }
-            _ if self.archive_shortcut_available()
-                && crate::key_hint::ctrl(KeyCode::Char('a')).is_press(key) =>
-            {
-                self.request_archive_for_selected_session();
+            _ if crate::key_hint::ctrl(KeyCode::Char('x')).is_press(key) => {
+                if self.archive_confirmation_pending() {
+                    self.confirm_archive();
+                } else if self.archive_shortcut_available() {
+                    self.request_archive_for_selected_session();
+                }
             }
             KeyEvent {
                 code: KeyCode::Char(c),
@@ -3199,6 +3205,18 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
         return vec![line, Line::default()];
     }
 
+    if state.archive_confirmation_pending() {
+        return vec![
+            vec![
+                " ".into(),
+                "[Archive?]".red(),
+                " press ctrl+x again to archive".dim(),
+            ]
+            .into(),
+            Line::default(),
+        ];
+    }
+
     let action_label = if state.status == SessionStatus::Archived {
         "restore"
     } else {
@@ -3237,7 +3255,7 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
     }
     if !state.filtered_rows.is_empty() && state.archive_shortcut_available() {
         first_row_hints.push(PickerFooterHint {
-            key: "ctrl+a".to_string(),
+            key: "ctrl+x".to_string(),
             wide_label: String::from("archive"),
             compact_label: String::from("archive"),
             priority: 2,
