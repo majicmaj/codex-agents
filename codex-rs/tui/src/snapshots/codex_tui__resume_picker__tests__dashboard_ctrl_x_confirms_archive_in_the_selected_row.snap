@@ -1,0 +1,11 @@
+---
+source: tui/src/resume_picker.rs
+expression: "render_dashboard_list_snapshot(&state, 80, 12)"
+---
+/work/selected  ─
+❯ [Idle]        Archive this chat? Ctrl+X again
+  10m ago        no branch
+
+/work/invocation  ─
+                Start a new agent
+  -              no branch

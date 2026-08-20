@@ -1589,6 +1589,14 @@ impl PickerState {
         {
             return Ok(self.handle_dashboard_exit_shortcut());
         }
+        if crate::key_hint::ctrl(KeyCode::Char('x')).is_press(key) && self.is_agents_dashboard() {
+            if self.archive_confirmation_pending() {
+                self.confirm_archive();
+            } else if self.archive_shortcut_available() {
+                self.request_archive_for_selected_session();
+            }
+            return Ok(None);
+        }
         if self.is_transcript_loading() {
             return Ok(self.handle_transcript_loading_key(key));
         }
@@ -2215,6 +2223,18 @@ impl PickerState {
             .filtered_rows
             .get(self.selected)
             .and_then(Row::seen_key);
+        let selected_dashboard_row_offset = self.is_agents_dashboard().then(|| {
+            let selected_start = if self.selected == 0 {
+                0
+            } else {
+                self.rendered_height_between(/*start*/ 0, self.selected - 1)
+                    + self.row_separator_height()
+            };
+            selected_start
+                + usize::from(self.starts_dashboard_group(self.selected, /*viewport_start*/ 0))
+        });
+        let selected_dashboard_viewport_offset = selected_dashboard_row_offset
+            .map(|offset| offset.saturating_sub(self.dashboard_scroll_offset));
         let base_iter = self
             .all_rows
             .iter()
@@ -2275,6 +2295,16 @@ impl PickerState {
         }
         if self.selected >= self.filtered_rows.len() {
             self.selected = self.filtered_rows.len().saturating_sub(1);
+        }
+        if let Some(viewport_offset) = selected_dashboard_viewport_offset {
+            let selected_start =
+                if self.selected == 0 {
+                    0
+                } else {
+                    self.rendered_height_between(/*start*/ 0, self.selected - 1)
+                        + self.row_separator_height()
+                } + usize::from(self.starts_dashboard_group(self.selected, /*viewport_start*/ 0));
+            self.dashboard_scroll_offset = selected_start.saturating_sub(viewport_offset);
         }
         if self.filtered_rows.is_empty() {
             self.scroll_top = 0;
@@ -3682,12 +3712,25 @@ fn render_comfortable_session_lines(
         selection_marker(is_selected, is_expanded)
     };
     let status_width = usize::from(dashboard) * DASHBOARD_STATUS_COLUMN_WIDTH;
+    let archive_confirmation = state.is_agents_dashboard()
+        && is_selected
+        && row
+            .thread_id
+            .is_some_and(|thread_id| state.is_archive_confirmation_for(thread_id));
     let title = truncate_text(
-        row.display_preview(),
+        if archive_confirmation {
+            "Archive this chat? Ctrl+X again"
+        } else {
+            row.display_preview()
+        },
         width.saturating_sub(2) as usize - status_width.min(width.saturating_sub(2) as usize),
     );
     let title = if dashboard {
-        title.set_style(dashboard_row_text_style(is_selected))
+        if archive_confirmation {
+            title.red().bold()
+        } else {
+            title.set_style(dashboard_row_text_style(is_selected))
+        }
     } else if is_selected {
         selected_session_title_span(title)
     } else {
@@ -3833,13 +3876,23 @@ fn render_dense_session_lines(
         }
     };
     let title = row.display_preview().to_string();
+    let archive_confirmation = state.is_agents_dashboard()
+        && is_selected
+        && row
+            .thread_id
+            .is_some_and(|thread_id| state.is_archive_confirmation_for(thread_id));
     let mut lines = vec![dense_summary_line(DenseSummaryInput {
         marker,
         date: &date,
-        title: &title,
+        title: if archive_confirmation {
+            "Archive this chat? Ctrl+X again"
+        } else {
+            &title
+        },
         dashboard_status: row.dashboard_status,
         is_dashboard: state.is_agents_dashboard(),
         is_selected,
+        archive_confirmation,
         is_zebra,
         width,
     })];
@@ -3913,6 +3966,7 @@ struct DenseSummaryInput<'a> {
     dashboard_status: Option<DashboardStatus>,
     is_dashboard: bool,
     is_selected: bool,
+    archive_confirmation: bool,
     is_zebra: bool,
     width: u16,
 }
@@ -3923,8 +3977,12 @@ fn dense_summary_line(input: DenseSummaryInput<'_>) -> Line<'static> {
     let status_width = usize::from(input.is_dashboard) * DASHBOARD_STATUS_COLUMN_WIDTH;
     let columns = dense_columns(available.saturating_sub(status_width));
     let title = if input.is_dashboard {
-        truncate_text(input.title, columns.title_width)
-            .set_style(dashboard_row_text_style(input.is_selected))
+        let title = truncate_text(input.title, columns.title_width);
+        if input.archive_confirmation {
+            title.red().bold()
+        } else {
+            title.set_style(dashboard_row_text_style(input.is_selected))
+        }
     } else if input.is_selected {
         selected_session_title_span(dense_column_text(input.title, columns.title_width))
     } else {
@@ -4683,6 +4741,68 @@ mod tests {
             ]
         );
         assert_eq!(state.filtered_rows[state.selected].thread_id, selected_id);
+    }
+
+    #[test]
+    fn dashboard_keeps_the_selected_row_in_place_when_older_rows_arrive() {
+        let selected = make_dashboard_row(
+            "/work/selected",
+            "2026-04-28T16:20:00Z",
+            "selected session",
+            DashboardStatus::Working,
+        );
+        let selected_id = selected.thread_id;
+        let mut state = dashboard_state(vec![selected]);
+        state.set_dashboard_group_mode(DashboardGroupMode::Status);
+        state.selected = state
+            .filtered_rows
+            .iter()
+            .position(|row| row.thread_id == selected_id)
+            .expect("selected row");
+        state.update_viewport(/*rows*/ 12, /*width*/ 80);
+
+        let selected_position = |state: &PickerState| {
+            let start =
+                if state.selected == 0 {
+                    0
+                } else {
+                    state.rendered_height_between(/*start*/ 0, state.selected - 1)
+                        + state.row_separator_height()
+                } + usize::from(state.starts_dashboard_group(state.selected, /*viewport_start*/ 0));
+            start.saturating_sub(state.dashboard_scroll_offset)
+        };
+        let before = selected_position(&state);
+
+        state.all_rows.push(make_dashboard_row(
+            "/work/older",
+            "2026-04-28T14:00:00Z",
+            "older session",
+            DashboardStatus::NeedsInput,
+        ));
+        state.apply_filter();
+
+        assert_eq!(state.filtered_rows[state.selected].thread_id, selected_id);
+        assert_eq!(selected_position(&state), before);
+    }
+
+    #[tokio::test]
+    async fn dashboard_ctrl_x_confirms_archive_in_the_selected_row() {
+        let mut state = dashboard_state(vec![make_dashboard_row(
+            "/work/selected",
+            "2026-04-28T16:20:00Z",
+            "selected session",
+            DashboardStatus::Idle,
+        )]);
+
+        state
+            .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await
+            .expect("archive confirmation shortcut");
+
+        assert!(state.archive_confirmation_pending());
+        insta::assert_snapshot!(render_dashboard_list_snapshot(
+            &state, /*width*/ 80, /*height*/ 12
+        ));
     }
 
     #[tokio::test]
@@ -7542,6 +7662,7 @@ session_picker_view = "dense"
             dashboard_status: None,
             is_dashboard: false,
             is_selected: true,
+            archive_confirmation: false,
             is_zebra: false,
             width: 80,
         });
@@ -7560,6 +7681,7 @@ session_picker_view = "dense"
             dashboard_status: None,
             is_dashboard: false,
             is_selected: false,
+            archive_confirmation: false,
             is_zebra: true,
             width: 80,
         });

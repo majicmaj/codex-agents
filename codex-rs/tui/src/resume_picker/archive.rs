@@ -126,6 +126,16 @@ impl PickerState {
         matches!(self.archive_state, ArchiveState::Confirming { .. })
     }
 
+    pub(super) fn is_archive_confirmation_for(&self, thread_id: ThreadId) -> bool {
+        matches!(
+            self.archive_state,
+            ArchiveState::Confirming {
+                thread_id: confirming_thread_id,
+                ..
+            } if confirming_thread_id == thread_id
+        )
+    }
+
     pub(super) fn handle_archive_result(
         &mut self,
         thread_id: ThreadId,
