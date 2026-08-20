@@ -4,16 +4,16 @@ expression: "render_dashboard_list_snapshot(&state, 48, 15)"
 ---
 Needs Input  ─
 ❯ [Needs Input] Approve deployment to production
-  Loading recent activity…
   42s ago
   ⌁ /a/very/long/project/path...   no branch
 
 Working  ─
   [Working]     Implement live status notific...
-  Loading recent activity…
   10m ago       ⌁ ~/Projects/claudex
    no branch
 
 Idle  ─
   [Idle]        Waiting for next prompt
+  2h ago        ⌁ ~/Projects/site
+   no branch
 ↓ more

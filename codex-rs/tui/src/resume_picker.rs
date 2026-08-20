@@ -2439,31 +2439,6 @@ impl PickerState {
         self.view_rows = if rows == 0 { None } else { Some(rows) };
         self.view_width = Some(width);
         self.ensure_selected_visible();
-        self.load_visible_dashboard_previews();
-    }
-
-    fn load_visible_dashboard_previews(&mut self) {
-        if !self.is_agents_dashboard() {
-            return;
-        }
-        let visible_rows = self.view_rows.unwrap_or_default();
-        if visible_rows == 0 {
-            return;
-        }
-        let visible_end = self
-            .scroll_top
-            .saturating_add(visible_rows)
-            .min(self.filtered_rows.len());
-        let thread_ids = self.filtered_rows[self.scroll_top..visible_end]
-            .iter()
-            .filter_map(|row| row.thread_id)
-            .filter(|thread_id| !self.transcript_previews.contains_key(thread_id))
-            .collect::<Vec<_>>();
-        for thread_id in thread_ids {
-            self.transcript_previews
-                .insert(thread_id, TranscriptPreviewState::Loading);
-            (self.picker_loader)(PickerLoadRequest::Preview { thread_id });
-        }
     }
 
     fn maybe_load_more_for_scroll(&mut self) {
@@ -5098,7 +5073,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_lazily_requests_and_caches_visible_subtitles() {
+    fn dashboard_loads_subtitle_only_after_expansion() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let request_sink = Arc::clone(&requests);
         let loader: PickerLoader = Arc::new(move |request| {
@@ -5131,6 +5106,10 @@ mod tests {
 
         state.update_viewport(/*rows*/ 1, /*width*/ 80);
         state.update_viewport(/*rows*/ 1, /*width*/ 80);
+
+        assert!(requests.lock().expect("request log").is_empty());
+
+        state.toggle_selected_expansion();
 
         let requested = requests
             .lock()
@@ -5477,9 +5456,10 @@ mod tests {
         ]);
         state.update_viewport(/*rows*/ 7, /*width*/ 92);
         state.move_dashboard_selection(/*down*/ true);
+        state.move_dashboard_selection(/*down*/ true);
 
-        assert_eq!(state.dashboard_scroll_offset, 2);
-        assert_eq!(state.scroll_top, 0);
+        assert_eq!(state.dashboard_scroll_offset, 3);
+        assert_eq!(state.scroll_top, 1);
         assert_snapshot!(
             "agents_dashboard_scrolls_by_rendered_lines",
             render_dashboard_list_snapshot(&state, /*width*/ 92, /*height*/ 7)

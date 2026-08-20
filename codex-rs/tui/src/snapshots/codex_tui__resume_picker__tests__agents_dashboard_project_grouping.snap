@@ -4,19 +4,19 @@ expression: "render_dashboard_list_snapshot(&state, 92, 18)"
 ---
 ~/Projects/claudex  ─
 ❯ [Working]     Build the agents dashboard
-  Loading recent activity…
   42s ago        no branch
 
   [Needs Input] Review daemon lifecycle
-  Loading recent activity…
   36m ago        no branch
 
 ~/Projects/site  ─
   [Idle]        Update landing page
-  Loading recent activity…
   2h ago         no branch
 
 ~/Projects/archive  ─
   [Done]        Old completed task
-  Loading recent activity…
-↓ more
+  1d ago         no branch
+
+/work/invocation  ─
+                Start a new agent
+  -              no branch
