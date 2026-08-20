@@ -26,6 +26,10 @@ use std::task::Context;
 use std::task::Poll;
 
 use crossterm::event::Event;
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
+use crossterm::event::KeyModifiers;
+use crossterm::event::MouseEventKind;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tokio_stream::Stream;
@@ -281,7 +285,22 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                 self.terminal_focused.store(false, Ordering::Relaxed);
                 None
             }
-            _ => None,
+            Event::Mouse(mouse_event) => match mouse_event.kind {
+                MouseEventKind::ScrollUp => Some(TuiEvent::Key(KeyEvent::new(
+                    KeyCode::Up,
+                    KeyModifiers::NONE,
+                ))),
+                MouseEventKind::ScrollDown => Some(TuiEvent::Key(KeyEvent::new(
+                    KeyCode::Down,
+                    KeyModifiers::NONE,
+                ))),
+                MouseEventKind::Down(_)
+                | MouseEventKind::Up(_)
+                | MouseEventKind::Drag(_)
+                | MouseEventKind::Moved
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight => None,
+            },
         }
     }
 }
@@ -320,9 +339,8 @@ impl<S: EventSource + Default + Unpin> Stream for TuiEventStream<S> {
 mod tests {
     use super::*;
     use crossterm::event::Event;
-    use crossterm::event::KeyCode;
-    use crossterm::event::KeyEvent;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::MouseButton;
+    use crossterm::event::MouseEvent;
     use pretty_assertions::assert_eq;
     use std::task::Context;
     use std::task::Poll;
@@ -432,6 +450,43 @@ mod tests {
             }
             other => panic!("expected key event, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mouse_wheel_uses_arrow_navigation_without_capturing_mouse_input() {
+        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        let mut stream = make_stream(broker, draw_rx, terminal_focused);
+
+        for (kind, code) in [
+            (MouseEventKind::ScrollUp, KeyCode::Up),
+            (MouseEventKind::ScrollDown, KeyCode::Down),
+        ] {
+            handle.send(Ok(Event::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })));
+
+            assert!(matches!(
+                stream.next().await,
+                Some(TuiEvent::Key(KeyEvent { code: actual, .. })) if actual == code
+            ));
+        }
+
+        handle.send(Ok(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        })));
+        let expected_key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        handle.send(Ok(Event::Key(expected_key)));
+
+        assert!(matches!(
+            stream.next().await,
+            Some(TuiEvent::Key(key)) if key == expected_key
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
