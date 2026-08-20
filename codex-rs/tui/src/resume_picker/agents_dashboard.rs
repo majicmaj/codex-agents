@@ -1,6 +1,18 @@
 //! Dashboard-specific composer, selection, grouping, and project context policy.
 
 use super::*;
+use std::time::Duration;
+use std::time::Instant;
+
+const EXIT_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn default_footer_hints() -> Vec<(String, String)> {
+    vec![
+        (String::from("enter"), String::from("start agent")),
+        (String::from("ctrl+g"), String::from("group")),
+        (String::from("ctrl+↑/↓"), String::from("select project")),
+    ]
+}
 
 pub(super) struct DashboardComposer {
     pub(super) composer: ChatComposer,
@@ -46,13 +58,47 @@ impl PickerState {
         );
         composer.set_frame_requester(self.requester.clone());
         composer.set_keymap_bindings(keymap);
-        composer.set_footer_hint_override(Some(vec![
-            (String::from("enter"), String::from("start agent")),
-            (String::from("ctrl+g"), String::from("group")),
-            (String::from("ctrl+↑/↓"), String::from("select project")),
-        ]));
+        composer.set_footer_hint_override(Some(default_footer_hints()));
         self.dashboard_composer = Some(DashboardComposer { composer });
         self.dashboard_fallback_cwd = Some(fallback_cwd.to_path_buf());
+    }
+
+    pub(super) fn handle_dashboard_exit_shortcut(&mut self) -> Option<SessionSelection> {
+        let now = Instant::now();
+        if self
+            .dashboard_exit_confirmation_expires_at
+            .take()
+            .is_some_and(|expires_at| now < expires_at)
+        {
+            return Some(SessionSelection::Exit);
+        }
+
+        self.dashboard_exit_confirmation_expires_at = Some(now + EXIT_CONFIRMATION_TIMEOUT);
+        if let Some(dashboard) = self.dashboard_composer.as_mut() {
+            dashboard.composer.set_footer_hint_override(Some(vec![(
+                String::from("ctrl+c"),
+                String::from("again to exit"),
+            )]));
+        }
+        self.requester.schedule_frame_in(EXIT_CONFIRMATION_TIMEOUT);
+        self.request_frame();
+        None
+    }
+
+    pub(super) fn expire_dashboard_exit_confirmation(&mut self) {
+        if self
+            .dashboard_exit_confirmation_expires_at
+            .is_none_or(|expires_at| Instant::now() < expires_at)
+        {
+            return;
+        }
+
+        self.dashboard_exit_confirmation_expires_at = None;
+        if let Some(dashboard) = self.dashboard_composer.as_mut() {
+            dashboard
+                .composer
+                .set_footer_hint_override(Some(default_footer_hints()));
+        }
     }
 
     pub(super) fn selected_project_cwd(&self, fallback: &Path) -> PathBuf {

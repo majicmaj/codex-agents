@@ -711,6 +711,7 @@ async fn run_session_picker_with_loader(
                     }
                     TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => {
                         state.expire_archive_confirmation();
+                        state.expire_dashboard_exit_confirmation();
                         if let Some(dashboard) = state.dashboard_composer.as_mut() {
                             if dashboard.composer.flush_paste_burst_if_due() {
                                 state.request_frame();
@@ -1062,6 +1063,7 @@ struct PickerState {
     dashboard_inventory_cwd: Option<PathBuf>,
     dashboard_restore_thread_id: Option<ThreadId>,
     dashboard_restore_cwd: Option<PathBuf>,
+    dashboard_exit_confirmation_expires_at: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1430,6 +1432,7 @@ impl PickerState {
             dashboard_inventory_cwd: None,
             dashboard_restore_thread_id: None,
             dashboard_restore_cwd: None,
+            dashboard_exit_confirmation_expires_at: None,
         }
     }
 
@@ -1574,6 +1577,18 @@ impl PickerState {
 
     async fn handle_key(&mut self, mut key: KeyEvent) -> Result<Option<SessionSelection>> {
         self.inline_error = None;
+        if self.is_agents_dashboard()
+            && matches!(
+                key,
+                KeyEvent {
+                    code: KeyCode::Char('c'),
+                    modifiers,
+                    ..
+                } if modifiers.contains(KeyModifiers::CONTROL)
+            )
+        {
+            return Ok(self.handle_dashboard_exit_shortcut());
+        }
         if self.is_transcript_loading() {
             return Ok(self.handle_transcript_loading_key(key));
         }
@@ -5490,6 +5505,60 @@ mod tests {
         assert_snapshot!(
             "agents_dashboard_composer",
             render_dashboard_snapshot(&state, /*width*/ 80, /*height*/ 20)
+        );
+    }
+
+    #[tokio::test]
+    async fn agents_dashboard_ctrl_c_requires_confirmation() {
+        let mut state = dashboard_state(vec![make_dashboard_row(
+            "/Users/majd/Projects/claudex",
+            "2026-04-28T16:29:18Z",
+            "Build the agents dashboard",
+            DashboardStatus::Working,
+        )]);
+        state.update_viewport(/*rows*/ 12, /*width*/ 80);
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        let first_press = state.handle_key(ctrl_c).await.expect("handle ctrl+c");
+
+        assert!(first_press.is_none());
+        assert!(state.dashboard_exit_confirmation_expires_at.is_some());
+        assert_snapshot!(
+            "agents_dashboard_exit_confirmation",
+            render_dashboard_snapshot(&state, /*width*/ 80, /*height*/ 20)
+        );
+
+        let second_press = state.handle_key(ctrl_c).await.expect("handle ctrl+c");
+
+        assert!(matches!(second_press, Some(SessionSelection::Exit)));
+    }
+
+    #[tokio::test]
+    async fn agents_dashboard_ctrl_c_confirmation_expires() {
+        let mut state = dashboard_state(Vec::new());
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(
+            state
+                .handle_key(ctrl_c)
+                .await
+                .expect("handle ctrl+c")
+                .is_none()
+        );
+        state.dashboard_exit_confirmation_expires_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+
+        state.expire_dashboard_exit_confirmation();
+
+        assert!(state.dashboard_exit_confirmation_expires_at.is_none());
+        let rendered = render_dashboard_snapshot(&state, /*width*/ 80, /*height*/ 20);
+        assert!(rendered.contains("enter start agent"));
+        assert!(!rendered.contains("again to exit"));
+        assert!(
+            state
+                .handle_key(ctrl_c)
+                .await
+                .expect("handle ctrl+c")
+                .is_none()
         );
     }
 

@@ -1,3 +1,4 @@
+mod agents_bootstrap;
 mod backend;
 mod client;
 mod managed_install;
@@ -201,18 +202,24 @@ pub async fn bootstrap(options: BootstrapOptions) -> Result<BootstrapOutput> {
         .await
 }
 
-/// Bootstraps the agents dashboard daemon using the update mechanism for the
-/// Codex distribution that launched it.
+/// Ensures the agents dashboard daemon is running using the update mechanism
+/// for the Codex distribution that launched it.
+///
+/// A healthy managed daemon is reused so launching the dashboard does not
+/// disconnect existing app-server clients.
 pub async fn bootstrap_for_agents(options: BootstrapOptions) -> Result<BootstrapOutput> {
     if std::env::var_os(CODEX_AGENTS_AUTO_UPDATE_ENV_VAR).is_some() {
         ensure_supported_platform()?;
         let codex_bin =
             std::env::current_exe().context("failed to resolve current Codex executable")?;
         Daemon::from_environment()?
-            .bootstrap(options, BootstrapSource::PackageManaged(codex_bin))
+            .bootstrap_for_agents(options, BootstrapSource::PackageManaged(codex_bin))
             .await
     } else {
-        bootstrap(options).await
+        ensure_supported_platform()?;
+        Daemon::from_environment()?
+            .bootstrap_for_agents(options, BootstrapSource::ManagedStandalone)
+            .await
     }
 }
 
@@ -625,21 +632,7 @@ impl Daemon {
         options: BootstrapOptions,
         source: BootstrapSource,
     ) -> Result<BootstrapOutput> {
-        let (codex_bin, auto_update_enabled) = match &source {
-            BootstrapSource::ManagedStandalone => {
-                self.ensure_managed_codex_bin()?;
-                (&self.managed_codex_bin, true)
-            }
-            BootstrapSource::PackageManaged(codex_bin) => {
-                if !codex_bin.is_file() {
-                    return Err(anyhow!(
-                        "package-managed Codex executable not found at {}",
-                        codex_bin.display()
-                    ));
-                }
-                (codex_bin, false)
-            }
-        };
+        let (codex_bin, auto_update_enabled) = self.bootstrap_binary(&source)?;
 
         let settings = DaemonSettings {
             remote_control_enabled: options.remote_control_enabled,
@@ -668,18 +661,52 @@ impl Daemon {
         }
 
         let info = self.wait_until_ready_with_bin(codex_bin).await?;
-        let managed_codex_version = self.codex_version_best_effort(codex_bin).await;
-        Ok(BootstrapOutput {
+        Ok(self
+            .bootstrap_output(
+                &settings,
+                codex_bin,
+                auto_update_enabled,
+                info.app_server_version,
+            )
+            .await)
+    }
+
+    fn bootstrap_binary<'a>(&'a self, source: &'a BootstrapSource) -> Result<(&'a Path, bool)> {
+        match source {
+            BootstrapSource::ManagedStandalone => {
+                self.ensure_managed_codex_bin()?;
+                Ok((&self.managed_codex_bin, true))
+            }
+            BootstrapSource::PackageManaged(codex_bin) => {
+                if !codex_bin.is_file() {
+                    return Err(anyhow!(
+                        "package-managed Codex executable not found at {}",
+                        codex_bin.display()
+                    ));
+                }
+                Ok((codex_bin, false))
+            }
+        }
+    }
+
+    async fn bootstrap_output(
+        &self,
+        settings: &DaemonSettings,
+        codex_bin: &Path,
+        auto_update_enabled: bool,
+        app_server_version: String,
+    ) -> BootstrapOutput {
+        BootstrapOutput {
             status: BootstrapStatus::Bootstrapped,
             backend: BackendKind::Pid,
             auto_update_enabled,
             remote_control_enabled: settings.remote_control_enabled,
             managed_codex_path: codex_bin.to_path_buf(),
-            managed_codex_version,
+            managed_codex_version: self.codex_version_best_effort(codex_bin).await,
             socket_path: self.socket_path.clone(),
             cli_version: env!("CARGO_PKG_VERSION").to_string(),
-            app_server_version: info.app_server_version,
-        })
+            app_server_version,
+        }
     }
 
     async fn running_backend(&self, settings: &DaemonSettings) -> Result<Option<BackendKind>> {
