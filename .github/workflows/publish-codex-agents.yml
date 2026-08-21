@@ -179,6 +179,17 @@ jobs:
           fi
           cargo build --target "$TARGET" --release "${build_args[@]}"
 
+      - name: Strip Linux package binaries
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          for binary in codex codex-code-mode-host; do
+            strip --strip-debug --strip-unneeded "target/${TARGET}/release/${binary}"
+          done
+
       - name: Smoke-test native binary
         if: runner.os != 'Windows' || matrix.target == 'x86_64-pc-windows-msvc'
         shell: bash
