@@ -125,6 +125,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
+          SKIP_MUSL_SYSTEM_PACKAGE_INSTALL: ${{ matrix.runner == 'codex-agents-release' && '1' || '0' }}
         run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
 
       - name: Disable aws-lc jitter entropy for musl
