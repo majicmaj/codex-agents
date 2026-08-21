@@ -655,7 +655,7 @@ impl App {
         tui: &mut tui::Tui,
         app_server: &mut AppServerSession,
         session_start_source: Option<ThreadStartSource>,
-        initial_user_message: Option<crate::chatwidget::UserMessage>,
+        initial_user_message: Option<crate::chatwidget::QueuedUserMessage>,
         new_thread_name: Option<String>,
     ) {
         // Start a fresh in-memory session while preserving resumability via persisted rollout
@@ -750,7 +750,7 @@ impl App {
         tui: &mut tui::Tui,
         started: AppServerStartedThread,
         presentation: ThreadAttachPresentation,
-        initial_user_message: Option<crate::chatwidget::UserMessage>,
+        initial_user_message: Option<crate::chatwidget::QueuedUserMessage>,
     ) -> Result<()> {
         // Initial messages are for freshly attached primary threads only. Thread switches and
         // resume/fork flows pass `None` so they cannot replay old history and then auto-submit a new

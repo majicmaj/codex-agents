@@ -533,7 +533,8 @@ async fn required_windows_sandbox_setup_defers_configured_initial_prompt() {
         WindowsSandboxModeToml::Unelevated,
     ]);
     chat.initial_user_message =
-        create_initial_user_message(Some(initial_prompt.clone()), Vec::new(), Vec::new());
+        create_initial_user_message(Some(initial_prompt.clone()), Vec::new(), Vec::new())
+            .map(Into::into);
 
     chat.handle_thread_session(crate::session_state::ThreadSessionState {
         thread_id: ThreadId::new(),

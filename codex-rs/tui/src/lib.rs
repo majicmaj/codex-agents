@@ -2462,7 +2462,7 @@ mod tests {
         let mut tui = tui::test_support::make_test_tui()?;
         let session_selection = resume_picker::SessionSelection::StartFreshIn {
             cwd: selected_cwd.clone(),
-            user_message: crate::chatwidget::UserMessage::from("Build the dashboard"),
+            user_message: crate::chatwidget::UserMessage::from("Build the dashboard").into(),
         };
 
         let resolved = resolve_startup_resume_or_fork_cwd(
@@ -2550,7 +2550,7 @@ mod tests {
         let mut tui = tui::test_support::make_test_tui()?;
         let selection = resume_picker::SessionSelection::StartFreshIn {
             cwd: selected_cwd.clone(),
-            user_message: crate::chatwidget::UserMessage::from("Build the dashboard"),
+            user_message: crate::chatwidget::UserMessage::from("Build the dashboard").into(),
         };
         let fallback_cwd = match resolve_startup_resume_or_fork_cwd(
             &mut tui,

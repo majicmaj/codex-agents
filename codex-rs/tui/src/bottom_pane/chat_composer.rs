@@ -62,6 +62,9 @@
 //! `Enter` submits immediately. `Tab` requests queuing while a task is running; if no task is
 //! running, `Tab` submits just like Enter so input is never dropped.
 //! `Tab` does not submit when entering a `!` shell command.
+//! Embedders that call [`ChatComposer::set_queue_submissions`] route `Enter` through this same
+//! queued-input path. If the slash popup is visible, its selected completion is applied first and
+//! the command is deferred for the fully configured `ChatWidget` to parse.
 //!
 //! On submit/queue paths, the composer:
 //!
@@ -9609,6 +9612,74 @@ mod tests {
                 text: "queued before session".to_string(),
                 text_elements: Vec::new(),
                 action: QueuedInputAction::Plain,
+                pending_pastes: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn enter_queues_selected_slash_popup_command_when_queue_submissions_is_enabled() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+        composer.set_queue_submissions(/*queue_submissions*/ true);
+        composer.insert_str("/sta");
+        assert!(matches!(composer.popups.active, ActivePopup::Command(_)));
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            result,
+            InputResult::Queued {
+                text: "/status".to_string(),
+                text_elements: Vec::new(),
+                action: QueuedInputAction::ParseSlash,
+                pending_pastes: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn tab_does_not_dispatch_skills_when_queue_submissions_is_enabled() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+        composer.set_queue_submissions(/*queue_submissions*/ true);
+        composer.insert_str("/ski");
+
+        let (tab_result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let (enter_result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(tab_result, InputResult::None);
+        assert_eq!(
+            enter_result,
+            InputResult::Queued {
+                text: "/skills".to_string(),
+                text_elements: vec![TextElement::new((0..7).into(), Some("/skills".to_string()),)],
+                action: QueuedInputAction::ParseSlash,
                 pending_pastes: Vec::new(),
             }
         );

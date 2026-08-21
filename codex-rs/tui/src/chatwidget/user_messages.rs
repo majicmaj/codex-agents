@@ -59,10 +59,10 @@ pub(super) enum ShellEscapePolicy {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct QueuedUserMessage {
-    pub(super) user_message: UserMessage,
-    pub(super) action: QueuedInputAction,
-    pub(super) pending_pastes: Vec<(String, String)>,
+pub(crate) struct QueuedUserMessage {
+    pub(crate) user_message: UserMessage,
+    pub(crate) action: QueuedInputAction,
+    pub(crate) pending_pastes: Vec<(String, String)>,
 }
 
 impl QueuedUserMessage {
