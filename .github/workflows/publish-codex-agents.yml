@@ -15,7 +15,7 @@ concurrency:
 jobs:
   validate-release:
     name: Validate release
-    runs-on: ubuntu-24.04
+    runs-on: codex-agents-release
     permissions:
       contents: read
     outputs:
@@ -207,7 +207,7 @@ jobs:
   publish-npm:
     name: Publish npm packages
     needs: [validate-release, build-native]
-    runs-on: ubuntu-24.04
+    runs-on: codex-agents-release
     timeout-minutes: 30
     environment: npm-release
     permissions:
