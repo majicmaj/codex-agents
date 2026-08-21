@@ -16,8 +16,10 @@ if [[ -n "${APT_INSTALL_ARGS:-}" ]]; then
   apt_install_args=(${APT_INSTALL_ARGS})
 fi
 
-sudo apt-get update "${apt_update_args[@]}"
-sudo apt-get install -y "${apt_install_args[@]}" ca-certificates curl musl-tools pkg-config libcap-dev g++ clang libc++-dev libc++abi-dev lld xz-utils
+if [[ "${SKIP_MUSL_SYSTEM_PACKAGE_INSTALL:-0}" != "1" ]]; then
+  sudo apt-get update "${apt_update_args[@]}"
+  sudo apt-get install -y "${apt_install_args[@]}" ca-certificates curl musl-tools pkg-config libcap-dev g++ clang libc++-dev libc++abi-dev lld xz-utils
+fi
 
 case "${TARGET}" in
   x86_64-unknown-linux-musl)
