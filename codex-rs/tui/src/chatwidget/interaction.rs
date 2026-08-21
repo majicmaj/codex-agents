@@ -74,14 +74,7 @@ impl ChatWidget {
                 self.quit_shortcut_expires_at = None;
                 self.quit_shortcut_key = None;
             }
-            KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers,
-                kind: KeyEventKind::Press,
-                ..
-            } if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                && c.eq_ignore_ascii_case(&'v') =>
-            {
+            key_event if is_paste_image_shortcut(key_event) => {
                 match paste_image_to_temp_png() {
                     Ok((path, info)) => {
                         tracing::debug!(

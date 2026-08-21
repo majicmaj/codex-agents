@@ -12,7 +12,11 @@ use crate::app_server_session::HISTORY_ITEM_PAGE_LIMIT;
 use crate::app_server_session::HISTORY_ITEM_SCAN_LIMIT;
 use crate::bottom_pane::ChatComposer;
 use crate::bottom_pane::InputResult;
+#[cfg(test)]
+use crate::bottom_pane::QueuedInputAction;
+use crate::clipboard_paste::is_paste_image_shortcut;
 use crate::clipboard_paste::normalize_pasted_search_query;
+use crate::clipboard_paste::paste_image_to_temp_png;
 use crate::color::blend;
 use crate::color::is_light;
 use crate::dashboard::DashboardGroupMode;
@@ -137,7 +141,7 @@ pub enum SessionSelection {
     ReconnectDashboard(DashboardResumeState),
     StartFreshIn {
         cwd: PathBuf,
-        user_message: crate::chatwidget::UserMessage,
+        user_message: crate::chatwidget::QueuedUserMessage,
     },
     Resume(SessionTarget),
     ResumeInSessionCwd(SessionTarget),
@@ -1058,7 +1062,7 @@ struct PickerState {
     dashboard_composer: Option<DashboardComposer>,
     dashboard_search_active: bool,
     dashboard_fallback_cwd: Option<PathBuf>,
-    pending_dashboard_submission: Option<crate::chatwidget::UserMessage>,
+    pending_dashboard_submission: Option<crate::chatwidget::QueuedUserMessage>,
     dashboard_system_errors: HashSet<ThreadId>,
     dashboard_inventory_cwd: Option<PathBuf>,
     dashboard_restore_thread_id: Option<ThreadId>,
@@ -4833,7 +4837,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dashboard_session_only_slash_command_explains_requirement() {
+    async fn dashboard_session_slash_command_starts_then_uses_shared_dispatch() {
         let mut state = dashboard_state(Vec::new());
         state
             .dashboard_composer
@@ -4845,12 +4849,50 @@ mod tests {
         let selection = state
             .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
-            .expect("status command");
+            .expect("status command")
+            .expect("new session selection");
 
-        assert!(selection.is_none());
+        let SessionSelection::StartFreshIn { cwd, user_message } = selection else {
+            panic!("expected fresh session for deferred status command");
+        };
+        assert_eq!(cwd, PathBuf::from("/work/invocation"));
         assert_eq!(
-            state.inline_error.as_deref(),
-            Some("Open a session before running /status")
+            user_message,
+            crate::chatwidget::QueuedUserMessage {
+                user_message: crate::chatwidget::UserMessage::from("/status"),
+                action: QueuedInputAction::ParseSlash,
+                pending_pastes: Vec::new(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_shell_input_starts_then_uses_shared_dispatch() {
+        let mut state = dashboard_state(Vec::new());
+        state
+            .dashboard_composer
+            .as_mut()
+            .expect("dashboard composer")
+            .composer
+            .insert_str("!pwd");
+
+        let selection = state
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .expect("shell input")
+            .expect("new session selection");
+
+        let SessionSelection::StartFreshIn { cwd, user_message } = selection else {
+            panic!("expected fresh session for deferred shell input");
+        };
+        assert_eq!(cwd, PathBuf::from("/work/invocation"));
+        assert_eq!(
+            user_message,
+            crate::chatwidget::QueuedUserMessage {
+                user_message: crate::chatwidget::UserMessage::from("!pwd"),
+                action: QueuedInputAction::RunShell,
+                pending_pastes: Vec::new(),
+            }
         );
     }
 
@@ -4911,18 +4953,22 @@ mod tests {
         assert_eq!(cwd, PathBuf::from("/work/selected"));
         assert_eq!(
             user_message,
-            crate::chatwidget::UserMessage {
-                text: String::from("ship the dashboard[Image #1]"),
-                local_images: vec![crate::bottom_pane::LocalImageAttachment {
-                    placeholder: String::from("[Image #1]"),
-                    path: image_path,
-                }],
-                remote_image_urls: Vec::new(),
-                text_elements: vec![codex_protocol::user_input::TextElement::new(
-                    (18..28).into(),
-                    Some(String::from("[Image #1]")),
-                )],
-                mention_bindings: Vec::new(),
+            crate::chatwidget::QueuedUserMessage {
+                user_message: crate::chatwidget::UserMessage {
+                    text: String::from("ship the dashboard[Image #1]"),
+                    local_images: vec![crate::bottom_pane::LocalImageAttachment {
+                        placeholder: String::from("[Image #1]"),
+                        path: image_path,
+                    }],
+                    remote_image_urls: Vec::new(),
+                    text_elements: vec![codex_protocol::user_input::TextElement::new(
+                        (18..28).into(),
+                        Some(String::from("[Image #1]")),
+                    )],
+                    mention_bindings: Vec::new(),
+                },
+                action: QueuedInputAction::Plain,
+                pending_pastes: Vec::new(),
             }
         );
     }
@@ -4985,14 +5031,80 @@ mod tests {
             (cwd, user_message),
             (
                 PathBuf::from("/work/selected"),
-                crate::chatwidget::UserMessage {
-                    text: String::from("123"),
-                    local_images: Vec::new(),
-                    remote_image_urls: Vec::new(),
-                    text_elements: Vec::new(),
-                    mention_bindings: Vec::new(),
+                crate::chatwidget::QueuedUserMessage {
+                    user_message: crate::chatwidget::UserMessage::from("123"),
+                    action: QueuedInputAction::Plain,
+                    pending_pastes: Vec::new(),
                 },
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_goal_preserves_large_multiline_paste_for_shared_dispatch() {
+        let mut state = dashboard_state(Vec::new());
+        state
+            .dashboard_composer
+            .as_mut()
+            .expect("dashboard composer")
+            .composer
+            .insert_str("/goal ");
+        let paste = format!("first line\n{}\nlast line", "x".repeat(1_100));
+
+        state.handle_paste(paste.clone());
+
+        let selection = state
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .expect("goal command")
+            .expect("new session selection");
+        let SessionSelection::StartFreshIn { cwd, user_message } = selection else {
+            panic!("expected fresh session for deferred goal command");
+        };
+        assert_eq!(cwd, PathBuf::from("/work/invocation"));
+        assert_eq!(user_message.action, QueuedInputAction::ParseSlash);
+        assert_eq!(user_message.pending_pastes.len(), 1);
+        assert_eq!(user_message.pending_pastes[0].1, paste);
+        assert_eq!(
+            user_message.user_message.text,
+            format!("/goal {}", user_message.pending_pastes[0].0)
+        );
+        assert!(user_message.user_message.local_images.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dashboard_pasted_image_path_is_preserved_in_new_session_input() {
+        let temp_dir = tempdir().expect("tempdir");
+        let image_path = temp_dir.path().join("dashboard-paste.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+            .save(&image_path)
+            .expect("write image");
+        let mut state = dashboard_state(Vec::new());
+
+        state.handle_paste(image_path.to_string_lossy().into_owned());
+        state
+            .dashboard_composer
+            .as_mut()
+            .expect("dashboard composer")
+            .composer
+            .insert_str("describe it");
+
+        let selection = state
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .expect("image prompt")
+            .expect("new session selection");
+        let SessionSelection::StartFreshIn { user_message, .. } = selection else {
+            panic!("expected fresh session for pasted image");
+        };
+        assert_eq!(user_message.action, QueuedInputAction::Plain);
+        assert_eq!(user_message.user_message.text, "[Image #1] describe it");
+        assert_eq!(
+            user_message.user_message.local_images,
+            vec![crate::bottom_pane::LocalImageAttachment {
+                placeholder: "[Image #1]".to_string(),
+                path: image_path,
+            }]
         );
     }
 

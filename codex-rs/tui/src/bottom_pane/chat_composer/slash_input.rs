@@ -263,7 +263,8 @@ impl ChatComposer {
                     .unwrap_or_else(|| first_line.clone());
                 popup.on_composer_text_change(filter_text);
                 if let Some(selected_cmd) = popup.selected_item() {
-                    if selected_command_dispatches_immediately_on_tab(&selected_cmd)
+                    if !self.queue_submissions
+                        && selected_command_dispatches_immediately_on_tab(&selected_cmd)
                         && let CommandItem::Builtin(cmd) = &selected_cmd
                     {
                         self.stage_selected_slash_command_history(&selected_cmd);
@@ -356,10 +357,35 @@ impl ChatComposer {
                             return (InputResult::ParentOwnedInputBlocked, true);
                         }
                     }
-                    if self
+                    let completed_inline_args = self
                         .complete_selected_slash_command_preserving_existing_draft_tail_as_inline_args(
                             &sel,
-                        )
+                        );
+                    if self.queue_submissions {
+                        if !completed_inline_args {
+                            let first_line = self
+                                .draft
+                                .textarea
+                                .text()
+                                .lines()
+                                .next()
+                                .unwrap_or("")
+                                .to_owned();
+                            if let Some(completed_text) =
+                                selected_command_completion(&first_line, &sel)
+                            {
+                                self.draft
+                                    .textarea
+                                    .set_text_clearing_elements(&completed_text);
+                                self.draft.is_bash_mode = false;
+                                self.draft
+                                    .textarea
+                                    .set_cursor(self.draft.textarea.text().len());
+                            }
+                        }
+                        return self.handle_submission(/*should_queue*/ true);
+                    }
+                    if completed_inline_args
                         && let Some(result) = self.try_dispatch_slash_command_with_args()
                     {
                         return (result, true);

@@ -423,7 +423,8 @@ async fn enqueue_primary_thread_session_replays_turns_before_initial_prompt_subm
             Some(initial_prompt.clone()),
             Vec::new(),
             Vec::new(),
-        ),
+        )
+        .map(Into::into),
         enhanced_keys_supported: false,
         has_chatgpt_account: false,
         has_codex_backend_auth: false,

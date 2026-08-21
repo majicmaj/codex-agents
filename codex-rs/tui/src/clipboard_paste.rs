@@ -1,6 +1,23 @@
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
+use crossterm::event::KeyEventKind;
+use crossterm::event::KeyModifiers;
 use std::path::Path;
 use std::path::PathBuf;
 use tempfile::Builder;
+
+pub(crate) fn is_paste_image_shortcut(key_event: KeyEvent) -> bool {
+    matches!(
+        key_event,
+        KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers,
+            kind: KeyEventKind::Press,
+            ..
+        } if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && c.eq_ignore_ascii_case(&'v')
+    )
+}
 
 #[derive(Debug, Clone)]
 pub enum PasteImageError {
@@ -384,6 +401,27 @@ mod pasted_search_query_tests {
             normalize_pasted_search_query("  alpha\n\tbeta\r\n gamma  "),
             Some(String::from("alpha beta gamma"))
         );
+    }
+
+    #[test]
+    fn image_paste_shortcut_accepts_cli_bindings_only_on_press() {
+        assert!(is_paste_image_shortcut(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(is_paste_image_shortcut(KeyEvent::new(
+            KeyCode::Char('V'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        )));
+        assert!(!is_paste_image_shortcut(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::NONE,
+        )));
+        assert!(!is_paste_image_shortcut(KeyEvent::new_with_kind(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Release,
+        )));
     }
 }
 

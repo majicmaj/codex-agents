@@ -744,7 +744,7 @@ impl App {
         &self,
         tui: &mut tui::Tui,
         cfg: crate::legacy_core::config::Config,
-        initial_user_message: Option<crate::chatwidget::UserMessage>,
+        initial_user_message: Option<crate::chatwidget::QueuedUserMessage>,
     ) -> crate::chatwidget::ChatWidgetInit {
         crate::chatwidget::ChatWidgetInit {
             config: cfg,
@@ -930,7 +930,8 @@ impl App {
                         initial_images.clone(),
                         // CLI prompt args are plain strings, so they don't provide element ranges.
                         Vec::new(),
-                    ),
+                    )
+                    .map(Into::into),
                     enhanced_keys_supported,
                     has_chatgpt_account,
                     has_codex_backend_auth,
@@ -1002,7 +1003,8 @@ impl App {
                         initial_images.clone(),
                         // CLI prompt args are plain strings, so they don't provide element ranges.
                         Vec::new(),
-                    ),
+                    )
+                    .map(Into::into),
                     enhanced_keys_supported,
                     has_chatgpt_account,
                     has_codex_backend_auth,
@@ -1041,7 +1043,8 @@ impl App {
                         initial_images.clone(),
                         // CLI prompt args are plain strings, so they don't provide element ranges.
                         Vec::new(),
-                    ),
+                    )
+                    .map(Into::into),
                     enhanced_keys_supported,
                     has_chatgpt_account,
                     has_codex_backend_auth,

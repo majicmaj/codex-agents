@@ -58,6 +58,10 @@ impl PickerState {
         );
         composer.set_frame_requester(self.requester.clone());
         composer.set_keymap_bindings(keymap);
+        // A dashboard submission starts a session before it can be acted on. Queueing lets the
+        // fully configured ChatWidget parse slash commands and shell input after startup, using
+        // the same deferred-input path as commands entered while an existing session is busy.
+        composer.set_queue_submissions(/*queue_submissions*/ true);
         composer.set_footer_hint_override(Some(default_footer_hints()));
         self.dashboard_composer = Some(DashboardComposer { composer });
         self.dashboard_fallback_cwd = Some(fallback_cwd.to_path_buf());
@@ -124,6 +128,30 @@ impl PickerState {
     }
 
     pub(super) fn handle_dashboard_composer_key(&mut self, key: KeyEvent) -> bool {
+        if is_paste_image_shortcut(key) {
+            let Some(dashboard_composer) = self.dashboard_composer.as_mut() else {
+                return false;
+            };
+            match paste_image_to_temp_png() {
+                Ok((path, info)) => {
+                    tracing::debug!(
+                        "pasted dashboard image size={}x{} format={}",
+                        info.width,
+                        info.height,
+                        info.encoded_format.label()
+                    );
+                    dashboard_composer.composer.attach_image(path);
+                    self.inline_error = None;
+                }
+                Err(err) => {
+                    tracing::warn!("failed to paste dashboard image: {err}");
+                    self.inline_error = Some(format!("Failed to paste image: {err}"));
+                }
+            }
+            self.request_frame();
+            return true;
+        }
+
         let composer_is_empty = self
             .dashboard_composer
             .as_ref()
@@ -152,17 +180,41 @@ impl PickerState {
         };
         if self.list_keymap.accept.is_pressed(key) {
             let text = dashboard_composer.composer.current_text_with_pending();
-            let group_mode = match text.trim() {
-                "/group project" => Some(DashboardGroupMode::Project),
-                "/group status" => Some(DashboardGroupMode::Status),
-                _ => None,
-            };
-            if let Some(group_mode) = group_mode {
-                dashboard_composer
-                    .composer
-                    .set_text_content(String::new(), Vec::new(), Vec::new());
-                self.set_dashboard_group_mode(group_mode);
-                return true;
+            match text.trim() {
+                "/group project" | "/group status" => {
+                    let group_mode = if text.trim().ends_with("project") {
+                        DashboardGroupMode::Project
+                    } else {
+                        DashboardGroupMode::Status
+                    };
+                    dashboard_composer.composer.set_text_content(
+                        String::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    );
+                    self.set_dashboard_group_mode(group_mode);
+                    return true;
+                }
+                "/vim" => {
+                    dashboard_composer.composer.set_text_content(
+                        String::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    );
+                    dashboard_composer.composer.toggle_vim_enabled();
+                    self.request_frame();
+                    return true;
+                }
+                "/mention" => {
+                    dashboard_composer.composer.set_text_content(
+                        "@".to_string(),
+                        Vec::new(),
+                        Vec::new(),
+                    );
+                    self.request_frame();
+                    return true;
+                }
+                _ => {}
             }
         }
         let (result, _) = dashboard_composer.composer.handle_key_event(key);
@@ -171,39 +223,36 @@ impl PickerState {
                 text,
                 text_elements,
             } => {
-                let local_images = dashboard_composer
-                    .composer
-                    .take_recent_submission_images_with_placeholders();
-                let remote_image_urls = dashboard_composer.composer.take_remote_image_urls();
-                let mention_bindings = dashboard_composer.composer.take_mention_bindings();
-                self.pending_dashboard_submission = Some(crate::chatwidget::UserMessage {
+                let user_message = dashboard_user_message_from_submission(
+                    &mut dashboard_composer.composer,
                     text,
-                    local_images,
-                    remote_image_urls,
                     text_elements,
-                    mention_bindings,
+                );
+                self.pending_dashboard_submission = Some(user_message.into());
+            }
+            InputResult::Queued {
+                text,
+                text_elements,
+                action,
+                pending_pastes,
+            } => {
+                let user_message = dashboard_user_message_from_submission(
+                    &mut dashboard_composer.composer,
+                    text,
+                    text_elements,
+                );
+                self.pending_dashboard_submission = Some(crate::chatwidget::QueuedUserMessage {
+                    user_message,
+                    action,
+                    pending_pastes,
                 });
             }
-            InputResult::CommandWithArgs(command, _, _) | InputResult::Command(command) => {
-                match command {
-                    crate::slash_command::SlashCommand::Vim => {
-                        dashboard_composer.composer.toggle_vim_enabled();
-                    }
-                    crate::slash_command::SlashCommand::Mention => {
-                        dashboard_composer.composer.insert_str("@");
-                    }
-                    _ => {
-                        self.inline_error = Some(format!(
-                            "Open a session before running /{}",
-                            command.as_ref()
-                        ));
-                    }
-                }
+            InputResult::Command(_)
+            | InputResult::ServiceTierCommand(_)
+            | InputResult::CommandWithArgs(_, _, _) => {
+                tracing::error!("dashboard composer dispatched input instead of queueing it");
             }
-            InputResult::ServiceTierCommand(_)
-            | InputResult::Queued { .. }
-            | InputResult::ParentOwnedInputBlocked
-            | InputResult::None => {}
+            InputResult::ParentOwnedInputBlocked | InputResult::None => {}
         }
         if dashboard_composer.composer.is_in_paste_burst() {
             self.requester
@@ -343,5 +392,19 @@ impl PickerState {
                         .cmp(&right.thread_id.map(|thread_id| thread_id.to_string()))
                 })
         });
+    }
+}
+
+fn dashboard_user_message_from_submission(
+    composer: &mut ChatComposer,
+    text: String,
+    text_elements: Vec<codex_protocol::user_input::TextElement>,
+) -> crate::chatwidget::UserMessage {
+    crate::chatwidget::UserMessage {
+        text,
+        local_images: composer.take_recent_submission_images_with_placeholders(),
+        remote_image_urls: composer.take_remote_image_urls(),
+        text_elements,
+        mention_bindings: composer.take_mention_bindings(),
     }
 }

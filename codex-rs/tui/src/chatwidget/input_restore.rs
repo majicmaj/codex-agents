@@ -20,13 +20,26 @@ impl ChatWidget {
             return;
         }
         if self.blocks_direct_input {
-            if let Some(user_message) = self.initial_user_message.take() {
-                self.restore_user_message_to_composer(user_message);
+            if let Some(queued_message) = self.initial_user_message.take() {
+                let QueuedUserMessage {
+                    user_message,
+                    pending_pastes,
+                    ..
+                } = queued_message;
+                self.restore_composer_state(Self::composer_state_from_user_message(
+                    user_message,
+                    pending_pastes,
+                ));
             }
             return;
         }
-        if let Some(user_message) = self.initial_user_message.take() {
-            self.submit_user_message(user_message);
+        if let Some(queued_message) = self.initial_user_message.take() {
+            let QueuedUserMessage {
+                user_message,
+                action,
+                pending_pastes,
+            } = queued_message;
+            self.queue_user_message_with_options(user_message, action, pending_pastes);
         }
     }
 

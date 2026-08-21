@@ -298,6 +298,7 @@ use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::custom_prompt_view::CustomPromptView;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
+use crate::clipboard_paste::is_paste_image_shortcut;
 use crate::clipboard_paste::paste_image_to_temp_png;
 use crate::collaboration_modes;
 use crate::diff_render::display_path_for;
@@ -438,7 +439,7 @@ mod user_messages;
 use self::user_messages::PendingSteer;
 use self::user_messages::PendingSteerCompareKey;
 use self::user_messages::QueueDrain;
-use self::user_messages::QueuedUserMessage;
+pub(crate) use self::user_messages::QueuedUserMessage;
 use self::user_messages::ShellEscapePolicy;
 use self::user_messages::ThreadComposerState;
 pub(crate) use self::user_messages::ThreadInputState;
@@ -501,7 +502,7 @@ pub(crate) struct ChatWidgetInit {
     /// Tests that do not exercise git status-line refreshes may leave this unset. Production TUI
     /// construction provides a runner for the active app-server session.
     pub(crate) workspace_command_runner: Option<WorkspaceCommandRunner>,
-    pub(crate) initial_user_message: Option<UserMessage>,
+    pub(crate) initial_user_message: Option<QueuedUserMessage>,
     pub(crate) enhanced_keys_supported: bool,
     pub(crate) has_chatgpt_account: bool,
     pub(crate) has_codex_backend_auth: bool,
@@ -560,7 +561,7 @@ pub(crate) struct ChatWidget {
     model_catalog: Arc<ModelCatalog>,
     session_telemetry: SessionTelemetry,
     session_header: SessionHeader,
-    initial_user_message: Option<UserMessage>,
+    initial_user_message: Option<QueuedUserMessage>,
     status_account_display: Option<StatusAccountDisplay>,
     runtime_model_provider_base_url: Option<String>,
     pub(crate) remote_connection: Option<RemoteConnectionStatus>,

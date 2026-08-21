@@ -113,12 +113,35 @@ async fn parent_owned_thread_blocks_settings_shortcuts() {
 async fn parent_owned_thread_restores_pending_initial_prompt() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ Some("gpt-5")).await;
     let pending_prompt = "keep this startup prompt".to_string();
-    chat.initial_user_message = Some(pending_prompt.clone().into());
+    chat.initial_user_message = Some(UserMessage::from(pending_prompt.clone()).into());
     chat.set_parent_owned_thread();
 
     chat.submit_initial_user_message_if_pending();
 
     assert_eq!(chat.bottom_pane.composer_text(), pending_prompt);
+    assert!(chat.initial_user_message.is_none());
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn initial_queued_goal_uses_shared_slash_dispatch() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Goals, /*enabled*/ true);
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    let placeholder = "[Pasted Content 1100 chars]".to_string();
+    let paste = "x".repeat(1_100);
+    chat.initial_user_message = Some(QueuedUserMessage {
+        user_message: UserMessage::from(format!("/goal {placeholder}")),
+        action: QueuedInputAction::ParseSlash,
+        pending_pastes: vec![(placeholder.clone(), paste.clone())],
+    });
+
+    chat.submit_initial_user_message_if_pending();
+
+    let draft = next_goal_draft(&mut rx, thread_id);
+    assert_eq!(draft.objective, placeholder);
+    assert_eq!(draft.pending_pastes, vec![(draft.objective.clone(), paste)]);
     assert!(chat.initial_user_message.is_none());
     assert_no_submit_op(&mut op_rx);
 }

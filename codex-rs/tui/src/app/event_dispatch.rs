@@ -103,7 +103,8 @@ impl App {
                         Some(text),
                         Vec::new(),
                         Vec::new(),
-                    ),
+                    )
+                    .map(Into::into),
                     /*new_thread_name*/ None,
                 )
                 .await;
