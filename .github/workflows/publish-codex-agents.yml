@@ -5,6 +5,8 @@ name: publish-codex-agents
 #   --repo majicmaj/codex-agents --env npm-release --allow-publish --yes
 
 on:
+  push:
+    branches: [main]
   release:
     types: [published]
   workflow_dispatch:
@@ -15,7 +17,7 @@ on:
         type: string
 
 concurrency:
-  group: publish-codex-agents
+  group: publish-codex-agents-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
@@ -23,25 +25,34 @@ jobs:
     name: Validate release
     runs-on: codex-agents-release
     permissions:
+      actions: read
       contents: read
     outputs:
       commit: ${{ steps.release.outputs.commit }}
+      prepared_run_id: ${{ steps.release.outputs.prepared_run_id }}
       version: ${{ steps.release.outputs.version }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          ref: ${{ github.event.release.tag_name || inputs.tag || github.sha }}
 
       - name: Validate stable release tag and commit
         id: release
         shell: bash
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
           IS_PRERELEASE: ${{ github.event.release.prerelease || false }}
           RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           set -euo pipefail
+
+          if [[ "${EVENT_NAME}" == "push" ]]; then
+            echo "commit=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           if [[ "${IS_PRERELEASE}" == "true" ]]; then
             echo "codex-agents npm releases must not be GitHub prereleases" >&2
@@ -60,11 +71,27 @@ jobs:
             exit 1
           fi
 
+          prepared_run_id="$(
+            gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/publish-codex-agents.yml/runs" \
+              -f head_sha="${commit}" \
+              -f status=success \
+              -f per_page=10 \
+              --jq '[.workflow_runs[] | select(.event == "push")][0].id // empty'
+          )"
+          if [[ -z "${prepared_run_id}" ]]; then
+            echo "No successful native artifact build found for ${commit}" >&2
+            echo "Wait for the publish-codex-agents push run on main, then rerun this release." >&2
+            exit 1
+          fi
+
           echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+          echo "prepared_run_id=${prepared_run_id}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
   build-native:
     name: Build ${{ matrix.target }}
+    if: github.event_name == 'push'
     needs: validate-release
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -74,8 +101,11 @@ jobs:
       run:
         working-directory: codex-rs
     env:
+      CARGO_INCREMENTAL: "0"
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       CARGO_TARGET_DIR: ${{ github.workspace }}/codex-rs/target
+      SCCACHE_CACHE_SIZE: 10G
+      USE_SCCACHE: ${{ (contains(matrix.target, 'windows') || matrix.target == 'x86_64-apple-darwin') && 'false' || 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -112,6 +142,44 @@ jobs:
           echo "CARGO_HOME=${cargo_home}" >> "$GITHUB_ENV"
           echo "${cargo_home}/bin" >> "$GITHUB_PATH"
           : > "${cargo_home}/config.toml"
+
+      - name: Compute Cargo cache keys
+        id: cargo-cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "lock=$(sha256sum Cargo.lock | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "toolchain=$(sha256sum rust-toolchain.toml | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Cargo home cache
+        id: cargo-home-cache
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ${{ github.workspace }}/.cargo-home/registry/index/
+            ${{ github.workspace }}/.cargo-home/registry/cache/
+            ${{ github.workspace }}/.cargo-home/git/db/
+          key: codex-agents-cargo-home-${{ matrix.runner }}-${{ matrix.target }}-${{ steps.cargo-cache.outputs.lock }}-${{ steps.cargo-cache.outputs.toolchain }}
+          restore-keys: |
+            codex-agents-cargo-home-${{ matrix.runner }}-${{ matrix.target }}-
+
+      - name: Install sccache
+        if: env.USE_SCCACHE == 'true'
+        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: sccache
+          version: 0.7.5
+
+      - name: Enable sccache
+        if: env.USE_SCCACHE == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
 
       - name: Install Zig
         if: runner.os == 'Linux'
@@ -222,13 +290,34 @@ jobs:
           path: codex-rs/dist/${{ matrix.target }}/codex-package-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
+      - name: Save Cargo home cache
+        if: always() && !cancelled() && steps.cargo-home-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ${{ github.workspace }}/.cargo-home/registry/index/
+            ${{ github.workspace }}/.cargo-home/registry/cache/
+            ${{ github.workspace }}/.cargo-home/git/db/
+          key: codex-agents-cargo-home-${{ matrix.runner }}-${{ matrix.target }}-${{ steps.cargo-cache.outputs.lock }}-${{ steps.cargo-cache.outputs.toolchain }}
+
+      - name: Report sccache statistics
+        if: always() && env.USE_SCCACHE == 'true'
+        continue-on-error: true
+        run: sccache --show-stats
+
   publish-npm:
     name: Publish npm packages
     needs: [validate-release, build-native]
+    if: always() && github.event_name != 'push' && needs.validate-release.result == 'success'
     runs-on: codex-agents-release
     timeout-minutes: 30
     environment: npm-release
     permissions:
+      actions: read
       contents: read
       id-token: write
     steps:
@@ -240,7 +329,9 @@ jobs:
       - name: Download native package archives
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          github-token: ${{ github.token }}
           path: native-artifacts
+          run-id: ${{ needs.validate-release.outputs.prepared_run_id }}
 
       - name: Setup Node.js for trusted publishing
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
