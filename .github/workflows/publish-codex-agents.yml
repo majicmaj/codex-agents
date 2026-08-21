@@ -173,13 +173,30 @@ jobs:
           tool: sccache
           version: 0.7.5
 
-      - name: Enable sccache
+      - name: Configure sccache backend
         if: env.USE_SCCACHE == 'true'
         shell: bash
         run: |
           set -euo pipefail
           echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          if [[ -n "${ACTIONS_CACHE_URL:-}" && -n "${ACTIONS_RUNTIME_TOKEN:-}" ]]; then
+            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+            echo "Using sccache GitHub backend"
+          else
+            echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
+            echo "SCCACHE_DIR=${GITHUB_WORKSPACE}/.sccache" >> "$GITHUB_ENV"
+            echo "Using sccache local disk + actions/cache fallback"
+          fi
+
+      - name: Restore sccache cache
+        if: env.USE_SCCACHE == 'true' && env.SCCACHE_GHA_ENABLED != 'true'
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: ${{ github.workspace }}/.sccache/
+          key: codex-agents-sccache-${{ matrix.runner }}-${{ matrix.target }}-${{ steps.cargo-cache.outputs.lock }}-${{ github.run_id }}
+          restore-keys: |
+            codex-agents-sccache-${{ matrix.runner }}-${{ matrix.target }}-${{ steps.cargo-cache.outputs.lock }}-
+            codex-agents-sccache-${{ matrix.runner }}-${{ matrix.target }}-
 
       - name: Install Zig
         if: runner.os == 'Linux'
@@ -308,6 +325,14 @@ jobs:
         if: always() && env.USE_SCCACHE == 'true'
         continue-on-error: true
         run: sccache --show-stats
+
+      - name: Save sccache cache
+        if: always() && !cancelled() && env.USE_SCCACHE == 'true' && env.SCCACHE_GHA_ENABLED != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: ${{ github.workspace }}/.sccache/
+          key: codex-agents-sccache-${{ matrix.runner }}-${{ matrix.target }}-${{ steps.cargo-cache.outputs.lock }}-${{ github.run_id }}
 
   publish-npm:
     name: Publish npm packages
