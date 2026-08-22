@@ -199,7 +199,29 @@ pub(super) async fn validate_thread_for_paginated_reads(
     }
     match metadata.history_mode {
         ThreadHistoryMode::Legacy => Err(ThreadStoreError::Unsupported { operation }),
-        ThreadHistoryMode::Paginated => Ok(()),
+        ThreadHistoryMode::Paginated => {
+            let is_plain_rollout = metadata
+                .rollout_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".jsonl"));
+            if is_plain_rollout
+                && tokio::fs::try_exists(metadata.rollout_path.as_path())
+                    .await
+                    .map_err(|err| ThreadStoreError::Internal {
+                        message: format!("failed to inspect thread rollout: {err}"),
+                    })?
+            {
+                let _writer_guard = store.live_writer_locks.lock(thread_id).await;
+                super::super::thread_history_materialization::materialize_to_sqlite(
+                    store,
+                    thread_id,
+                    metadata.rollout_path.as_path(),
+                )
+                .await?;
+            }
+            Ok(())
+        }
     }
 }
 
