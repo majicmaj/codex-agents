@@ -1768,6 +1768,77 @@ SELECT
 }
 
 #[tokio::test]
+async fn catch_up_skips_repeated_no_op_ordinal_and_projects_later_history() {
+    let home = TempDir::new().expect("temp dir");
+    let store = projection_store(home.path()).await;
+    let thread_id = ThreadId::default();
+    create_paginated_thread(&store, thread_id).await;
+    store
+        .persist_thread(thread_id, PersistContext::Standard)
+        .await
+        .expect("persist session metadata");
+
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
+    let before = projection_state(&pool, thread_id).await;
+    let rollout_path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("rollout path");
+    let suffix = format!(
+        "{}\n{}\n{}\n{}\n",
+        rollout_line(Some(0), user_message("repeated no-op metadata")),
+        rollout_line(Some(1), turn_started("turn-1")),
+        rollout_line(
+            Some(2),
+            completed_item(
+                thread_id,
+                "turn-1",
+                agent_message("agent-1", MessagePhase::FinalAnswer),
+            ),
+        ),
+        rollout_line(Some(3), turn_completed("turn-1")),
+    );
+    append_suffix(rollout_path.as_path(), suffix.as_str());
+
+    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
+        .await
+        .expect("catch up past repeated no-op ordinal");
+
+    let expected_offset = before.0 + i64::try_from(suffix.len()).expect("suffix byte count");
+    assert_eq!(
+        projection_state(&pool, thread_id).await,
+        (expected_offset, 4)
+    );
+    let recovered_history = sqlx::query_as::<_, (String, String, String)>(
+        r#"
+SELECT turns.turn_id, turns.status, items.item_id
+FROM thread_turns AS turns
+JOIN thread_items AS items
+  ON items.thread_id = turns.thread_id
+ AND items.turn_id = turns.turn_id
+WHERE turns.thread_id = ?
+ORDER BY turns.rollout_ordinal, items.rollout_ordinal
+        "#,
+    )
+    .bind(thread_id.to_string())
+    .fetch_all(&pool)
+    .await
+    .expect("read recovered history");
+    assert_eq!(
+        recovered_history,
+        vec![(
+            "turn-1".to_string(),
+            "completed".to_string(),
+            "agent-1".to_string(),
+        )],
+    );
+}
+
+#[tokio::test]
 async fn jsonl_failure_does_not_create_projection_database() {
     let home = TempDir::new().expect("temp dir");
     fs::write(home.path().join("sessions"), "not a directory").expect("block sessions dir");
