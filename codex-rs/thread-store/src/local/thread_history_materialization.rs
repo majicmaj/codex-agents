@@ -185,18 +185,37 @@ async fn read_projection_steps(
                 });
             }
         };
+        let Some(line) = line else {
+            pending_rejected_line_count += 1;
+            line_start_offset = line_end_offset;
+            continue;
+        };
+        let projected_changes = project_rollout_line(&line);
         if ordinal < next_ordinal {
+            let repeats_previous_ordinal = next_ordinal.checked_sub(1) == Some(ordinal);
+            if pending_rejected_line_count == 0
+                && repeats_previous_ordinal
+                && projected_changes.is_empty()
+            {
+                warn!(
+                    thread_id = %thread_id,
+                    rollout_path = %rollout_path.display(),
+                    line_start_byte_offset = line_start_offset,
+                    line_end_byte_offset = line_end_offset,
+                    expected_ordinal = next_ordinal,
+                    line_ordinal = ordinal,
+                    "skipping repeated rollout ordinal with no thread history changes"
+                );
+                next_offset = line_end_offset;
+                line_start_offset = line_end_offset;
+                continue;
+            }
             return Err(ThreadStoreError::Internal {
                 message: format!(
                     "thread history projection for {thread_id} expected ordinal {next_ordinal}, got {ordinal}"
                 ),
             });
         }
-        let Some(line) = line else {
-            pending_rejected_line_count += 1;
-            line_start_offset = line_end_offset;
-            continue;
-        };
         let skipped_ordinal_count = ordinal - next_ordinal;
         if skipped_ordinal_count > pending_rejected_line_count {
             return Err(ThreadStoreError::Internal {
@@ -208,7 +227,7 @@ async fn read_projection_steps(
         let changes = if subagent_history_start_ordinal.is_some_and(|start| ordinal < start) {
             ThreadHistoryChangeSet::default()
         } else {
-            project_rollout_line(&line)
+            projected_changes
         };
         let fallback_created_at_ms = if changes
             .changed_items
