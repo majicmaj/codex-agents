@@ -3,6 +3,8 @@ name: publish-codex-agents
 # One-time npm setup:
 # npm trust github codex-agents --file publish-codex-agents.yml \
 #   --repo majicmaj/codex-agents --env npm-release --allow-publish --yes
+# Bump .github/codex-agents-native-build-version whenever build-native changes
+# in a way that can alter the packaged native artifacts.
 
 on:
   push:
@@ -71,16 +73,46 @@ jobs:
             exit 1
           fi
 
-          prepared_run_id="$(
+          native_inputs=(
+            codex-rs
+            .github/actions/setup-msvc-env
+            .github/actions/setup-rusty-v8
+            .github/scripts/build-codex-package-archive.sh
+            .github/scripts/install-musl-build-tools.sh
+            scripts/build_codex_package.py
+            scripts/codex_package
+          )
+          native_build_version="$(tr -d '[:space:]' < .github/codex-agents-native-build-version)"
+          prepared_run_id=""
+          mapfile -t prepared_runs < <(
             gh api --method GET \
               "repos/${GITHUB_REPOSITORY}/actions/workflows/publish-codex-agents.yml/runs" \
-              -f head_sha="${commit}" \
               -f status=success \
-              -f per_page=10 \
-              --jq '[.workflow_runs[] | select(.event == "push")][0].id // empty'
-          )"
+              -f per_page=100 \
+              --jq '.workflow_runs[] | select(.event == "push") | [.id, .head_sha] | @tsv'
+          )
+          for prepared_run in "${prepared_runs[@]}"; do
+            IFS=$'\t' read -r run_id run_commit <<< "${prepared_run}"
+            if ! git merge-base --is-ancestor "${run_commit}" "${commit}"; then
+              continue
+            fi
+            run_build_version="$(
+              git show "${run_commit}:.github/codex-agents-native-build-version" 2>/dev/null \
+                | tr -d '[:space:]' \
+                || true
+            )"
+            # Builds created before this version file was introduced are version 1.
+            run_build_version="${run_build_version:-1}"
+            if [[ "${run_build_version}" != "${native_build_version}" ]]; then
+              continue
+            fi
+            if git diff --quiet "${run_commit}" "${commit}" -- "${native_inputs[@]}"; then
+              prepared_run_id="${run_id}"
+              break
+            fi
+          done
           if [[ -z "${prepared_run_id}" ]]; then
-            echo "No successful native artifact build found for ${commit}" >&2
+            echo "No compatible successful native artifact build found for ${commit}" >&2
             echo "Wait for the publish-codex-agents push run on main, then rerun this release." >&2
             exit 1
           fi
@@ -338,7 +370,7 @@ jobs:
     name: Publish npm packages
     needs: [validate-release, build-native]
     if: always() && github.event_name != 'push' && needs.validate-release.result == 'success'
-    runs-on: codex-agents-release
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: npm-release
     permissions:
