@@ -94,7 +94,7 @@ jobs:
     if: github.event_name == 'push'
     needs: validate-release
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     permissions:
       contents: read
     defaults:
