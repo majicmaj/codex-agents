@@ -3,8 +3,10 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use serde::Deserialize;
 use serde::Serialize;
 use sqlx::Row;
+use tracing::warn;
 
 use super::super::LocalThreadStore;
+use super::super::read_thread;
 use super::super::rollout_lineage::RolloutLineage;
 use super::segment_paging::page_item_rows;
 use super::segment_paging::page_turn_rows;
@@ -200,26 +202,59 @@ pub(super) async fn validate_thread_for_paginated_reads(
     match metadata.history_mode {
         ThreadHistoryMode::Legacy => Err(ThreadStoreError::Unsupported { operation }),
         ThreadHistoryMode::Paginated => {
-            let is_plain_rollout = metadata
-                .rollout_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".jsonl"));
-            if is_plain_rollout
-                && tokio::fs::try_exists(metadata.rollout_path.as_path())
+            let resolved_rollout_path =
+                read_thread::resolve_rollout_path(store, thread_id, /*include_archived*/ true)
+                    .await?;
+            if let Some(rollout_path) = resolved_rollout_path.as_ref()
+                && codex_rollout::plain_rollout_path(rollout_path.as_path()).as_path()
+                    == rollout_path.as_path()
+                && let Some(projection) = super::projection_state(store, thread_id).await?
+                && tokio::fs::metadata(rollout_path.as_path())
                     .await
-                    .map_err(|err| ThreadStoreError::Internal {
-                        message: format!("failed to inspect thread rollout: {err}"),
-                    })?
+                    .is_ok_and(|metadata| projection.next_byte_offset == metadata.len())
             {
-                let _writer_guard = store.live_writer_locks.lock(thread_id).await;
-                super::super::thread_history_materialization::materialize_to_sqlite(
-                    store,
-                    thread_id,
-                    metadata.rollout_path.as_path(),
-                )
-                .await?;
+                return Ok(());
             }
+            let _maintenance_guard = match codex_rollout::try_acquire_rollout_maintenance_lock(
+                &store.config.codex_home,
+            ) {
+                Ok(Some(guard)) => guard,
+                Ok(None) => return Ok(()),
+                Err(err) => {
+                    warn!(
+                        thread_id = %thread_id,
+                        error = %err,
+                        "skipping paginated history repair because rollout maintenance lock failed"
+                    );
+                    return Ok(());
+                }
+            };
+            let Some(rollout_path) =
+                read_thread::resolve_rollout_path(store, thread_id, /*include_archived*/ true)
+                    .await?
+            else {
+                return Ok(());
+            };
+            let rollout_path = match codex_rollout::materialize_rollout_for_reference(
+                rollout_path.as_path(),
+            )
+            .await
+            {
+                Ok(path) => path,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) => {
+                    return Err(ThreadStoreError::Internal {
+                        message: format!("failed to materialize thread rollout: {err}"),
+                    });
+                }
+            };
+            let _writer_guard = store.live_writer_locks.lock(thread_id).await;
+            super::super::thread_history_materialization::materialize_to_sqlite(
+                store,
+                thread_id,
+                rollout_path.as_path(),
+            )
+            .await?;
             Ok(())
         }
     }
