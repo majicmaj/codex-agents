@@ -42,6 +42,8 @@ use crate::AppendThreadItemsParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
 use crate::ForkBoundary;
+use crate::ItemSortKey;
+use crate::ListItemsParams;
 use crate::ListThreadsParams;
 use crate::ListTurnsParams;
 use crate::PersistContext;
@@ -1768,10 +1770,28 @@ SELECT
 }
 
 #[tokio::test]
-async fn catch_up_skips_repeated_no_op_ordinal_and_projects_later_history() {
+async fn paginated_read_repairs_repeated_no_op_ordinal_and_projects_later_history() {
     let home = TempDir::new().expect("temp dir");
-    let store = projection_store(home.path()).await;
+    let config = test_config(home.path());
     let thread_id = ThreadId::default();
+    let runtime = codex_state::StateRuntime::init(
+        config.sqlite.clone(),
+        config.default_model_provider_id.clone(),
+    )
+    .await
+    .expect("state runtime");
+    let mut builder = codex_state::ThreadMetadataBuilder::new(
+        thread_id,
+        home.path().join("pending-rollout.jsonl"),
+        Utc::now(),
+        SessionSource::Cli,
+    );
+    builder.history_mode = ThreadHistoryMode::Paginated;
+    runtime
+        .upsert_thread(&builder.build(config.default_model_provider_id.as_str()))
+        .await
+        .expect("seed thread metadata");
+    let store = LocalThreadStore::new(config, Some(runtime.clone()));
     create_paginated_thread(&store, thread_id).await;
     store
         .persist_thread(thread_id, PersistContext::Standard)
@@ -1788,6 +1808,10 @@ async fn catch_up_skips_repeated_no_op_ordinal_and_projects_later_history() {
         .live_rollout_path(thread_id)
         .await
         .expect("rollout path");
+    store
+        .shutdown_thread(thread_id)
+        .await
+        .expect("shutdown thread before external rollout updates");
     let suffix = format!(
         "{}\n{}\n{}\n{}\n",
         rollout_line(Some(0), user_message("repeated no-op metadata")),
@@ -1803,10 +1827,55 @@ async fn catch_up_skips_repeated_no_op_ordinal_and_projects_later_history() {
         rollout_line(Some(3), turn_completed("turn-1")),
     );
     append_suffix(rollout_path.as_path(), suffix.as_str());
-
-    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
+    compress_rollout(rollout_path.as_path());
+    let compressed_path = rollout_path.with_extension("jsonl.zst");
+    let mut metadata = runtime
+        .get_thread(thread_id)
         .await
-        .expect("catch up past repeated no-op ordinal");
+        .expect("read thread metadata")
+        .expect("thread metadata");
+    metadata.rollout_path = home.path().join("stale-rollout-path.jsonl");
+    runtime
+        .upsert_thread(&metadata)
+        .await
+        .expect("persist stale rollout path");
+
+    let maintenance_guard = codex_rollout::try_acquire_rollout_maintenance_lock(home.path())
+        .expect("acquire maintenance lock")
+        .expect("maintenance lock available");
+    let items_while_maintenance_runs = store
+        .list_items(ListItemsParams {
+            thread_id,
+            turn_id: None,
+            include_archived: false,
+            cursor: None,
+            page_size: 10,
+            sort_direction: SortDirection::Asc,
+            sort_key: ItemSortKey::CreatedAtOrdinal,
+            after_updated_at_ordinal: None,
+        })
+        .await
+        .expect("read projected prefix during rollout maintenance");
+    assert!(items_while_maintenance_runs.items.is_empty());
+    assert_eq!(projection_state(&pool, thread_id).await, before);
+    drop(maintenance_guard);
+
+    store
+        .list_items(ListItemsParams {
+            thread_id,
+            turn_id: None,
+            include_archived: false,
+            cursor: None,
+            page_size: 10,
+            sort_direction: SortDirection::Asc,
+            sort_key: ItemSortKey::CreatedAtOrdinal,
+            after_updated_at_ordinal: None,
+        })
+        .await
+        .expect("read and repair history past repeated no-op ordinal");
+
+    assert!(rollout_path.exists());
+    assert!(!compressed_path.exists());
 
     let expected_offset = before.0 + i64::try_from(suffix.len()).expect("suffix byte count");
     assert_eq!(

@@ -1676,6 +1676,9 @@ async fn migration_preserves_compressed_rollouts_during_publish_and_recovery() {
     let turns = list_active_summary_turns(&store, thread_id).await;
     assert_eq!(turns.turns.len(), 1);
     assert_eq!(turns.turns[0].items.len(), 2);
+    assert!(path.exists());
+    assert!(!compressed_path.exists());
+    assert_eq!(compress_rollout(&path), compressed_path);
 
     thread_history::delete_thread(&store, thread_id)
         .await
